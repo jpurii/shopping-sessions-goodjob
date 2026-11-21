@@ -1019,16 +1019,109 @@ fn main() {
         Q,
         || DState { users: Vec::new(), camp: CampMap::default() },
         |st, q| {
-            let mut evs: Vec<Sv> = Vec::with_capacity(cstates_ref.iter().map(|c| c.sv[q].len()).sum());
+            // Group by person in linear time: dense local person ids from a flat
+            // table, a counting-sort scatter, then sort each person's few rows.
+            let ne: usize = cstates_ref.iter().map(|c| c.sv[q].len()).sum();
+            let cap = (ne.max(8) * 2).next_power_of_two();
+            let mask = cap - 1;
+            let mut slot = vec![u32::MAX; cap];
+            let mut pkeys: Vec<u128> = Vec::new();
+            let mut ecount: Vec<u32> = Vec::new();
+            let mut epid: Vec<u32> = Vec::with_capacity(ne);
+            let find = |slot: &[u32], pkeys: &[u128], k: u128| -> usize {
+                let mut i = hk(k) as usize & mask;
+                loop {
+                    let v = slot[i];
+                    if v == u32::MAX || pkeys[v as usize] == k {
+                        return i;
+                    }
+                    i = (i + 1) & mask;
+                }
+            };
             for c in cstates_ref {
-                evs.extend_from_slice(&c.sv[q]);
+                for e in &c.sv[q] {
+                    let i = find(&slot, &pkeys, e.person);
+                    let p = if slot[i] == u32::MAX {
+                        slot[i] = pkeys.len() as u32;
+                        pkeys.push(e.person);
+                        ecount.push(0);
+                        pkeys.len() as u32 - 1
+                    } else {
+                        slot[i]
+                    };
+                    ecount[p as usize] += 1;
+                    epid.push(p);
+                }
             }
-            let mut cks: Vec<Cp> = Vec::with_capacity(cstates_ref.iter().map(|c| c.ck[q].len()).sum());
+            let np = pkeys.len();
+            let mut eoff: Vec<u32> = Vec::with_capacity(np + 1);
+            let mut acc = 0u32;
+            for &n in &ecount {
+                eoff.push(acc);
+                acc += n;
+            }
+            eoff.push(acc);
+            let mut evs: Vec<Sv> = Vec::with_capacity(ne);
+            {
+                let mut pos: Vec<u32> = eoff[..np].to_vec();
+                let dst = evs.spare_capacity_mut();
+                let mut j = 0;
+                for c in cstates_ref {
+                    for e in &c.sv[q] {
+                        let p = epid[j] as usize;
+                        dst[pos[p] as usize].write(*e);
+                        pos[p] += 1;
+                        j += 1;
+                    }
+                }
+                // Safety: the counts cover every slot 0..ne exactly once.
+                unsafe { evs.set_len(ne) };
+            }
+            drop(epid);
+            let mut ckp_pid: Vec<u32> = Vec::new();
+            let mut ccount = vec![0u32; np];
             for c in cstates_ref {
-                cks.extend_from_slice(&c.ck[q]);
+                for k in &c.ck[q] {
+                    let i = find(&slot, &pkeys, k.person);
+                    let p = slot[i];
+                    if p != u32::MAX {
+                        ccount[p as usize] += 1;
+                    }
+                    ckp_pid.push(p);
+                }
             }
-            evs.sort_unstable_by_key(|e| (e.person, e.ts));
-            cks.sort_unstable_by(|a, b| (a.person, a.ts, a.cid).cmp(&(b.person, b.ts, b.cid)));
+            let mut coff: Vec<u32> = Vec::with_capacity(np + 1);
+            let mut acc = 0u32;
+            for &n in &ccount {
+                coff.push(acc);
+                acc += n;
+            }
+            coff.push(acc);
+            let nc = acc as usize;
+            let mut cks: Vec<Cp> = Vec::with_capacity(nc);
+            {
+                let mut pos: Vec<u32> = coff[..np].to_vec();
+                let dst = cks.spare_capacity_mut();
+                let mut j = 0;
+                for c in cstates_ref {
+                    for k in &c.ck[q] {
+                        let p = ckp_pid[j];
+                        j += 1;
+                        if p != u32::MAX {
+                            dst[pos[p as usize] as usize].write(*k);
+                            pos[p as usize] += 1;
+                        }
+                    }
+                }
+                // Safety: the counts cover every slot 0..nc exactly once.
+                unsafe { cks.set_len(nc) };
+            }
+            drop(ckp_pid);
+            drop(slot);
+            for p in 0..np {
+                evs[eoff[p] as usize..eoff[p + 1] as usize].sort_unstable_by_key(|e| e.ts);
+                cks[coff[p] as usize..coff[p + 1] as usize].sort_unstable_by(|a, b| (a.ts, a.cid).cmp(&(b.ts, b.cid)));
+            }
 
             let mut sess: Vec<Sess> = Vec::new();
             let mut dend: Vec<usize> = Vec::new();
@@ -1067,24 +1160,10 @@ fn main() {
                 }
             };
 
-            let (mut ei, mut ci) = (0usize, 0usize);
-            while ei < evs.len() {
-                let person = evs[ei].person;
-                let mut ej = ei;
-                while ej < evs.len() && evs[ej].person == person {
-                    ej += 1;
-                }
-                while ci < cks.len() && cks[ci].person < person {
-                    ci += 1;
-                }
-                let mut cj = ci;
-                while cj < cks.len() && cks[cj].person == person {
-                    cj += 1;
-                }
-                let evp = &evs[ei..ej];
-                let ckp = &cks[ci..cj];
-                ei = ej;
-                ci = cj;
+            for p in 0..np {
+                let person = pkeys[p];
+                let evp = &evs[eoff[p] as usize..eoff[p + 1] as usize];
+                let ckp = &cks[coff[p] as usize..coff[p + 1] as usize];
 
                 // sessions and user_daily rows
                 sess.clear();
