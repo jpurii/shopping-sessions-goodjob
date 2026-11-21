@@ -597,14 +597,31 @@ struct Sess {
 
 const _: () = assert!(std::mem::size_of::<Ev>() == 48);
 
-type CampMap = HashMap<(u32, i32), [i64; 4]>;
+/// Campaign x day totals [sessions, purchasing, revenue, assisted], dense over
+/// (campaign, day - d0): every session starts inside the window, so its day is
+/// in d0..d0+nd. A (campaign, day) has a row iff it has a session or an assist.
+struct CampDays {
+    v: Vec<[i64; 4]>,
+    nd: usize,
+    d0: i32,
+}
+
+impl CampDays {
+    fn new(ncamp: usize, d0: i32, nd: usize) -> CampDays {
+        CampDays { v: vec![[0; 4]; ncamp * nd], nd, d0 }
+    }
+    #[inline(always)]
+    fn at(&mut self, c: u32, day: i32) -> &mut [i64; 4] {
+        &mut self.v[c as usize * self.nd + (day - self.d0) as usize]
+    }
+}
 
 /// Campaign `c` assisted sessions a..b (in start order): add them per day.
-fn assists(camp: &mut CampMap, sess: &[Sess], dend: &[usize], c: u32, a: usize, b: usize) {
+fn assists(camp: &mut CampDays, sess: &[Sess], dend: &[usize], c: u32, a: usize, b: usize) {
     let mut i = a;
     while i < b {
         let e = dend[i].min(b);
-        camp.entry((c, sess[i].day)).or_insert([0; 4])[3] += (e - i) as i64;
+        camp.at(c, sess[i].day)[3] += (e - i) as i64;
         i = e;
     }
 }
@@ -1039,15 +1056,18 @@ fn main() {
     // -------------------------------------------------- phase D: sessions
     struct DState {
         users: Vec<UserRow>,
-        camp: CampMap,
+        camp: CampDays,
     }
     let cstates_ref = &cstates;
     let rank = &rank;
     let ncat = cat_names.len();
+    // Session start days lie in the event window: d0 ..= day of (window_end - 1 ms).
+    let d0 = ws.div_euclid(DAY) as i32;
+    let nd = ((we - 1).div_euclid(DAY) - ws.div_euclid(DAY) + 1).max(1) as usize;
     let dstates = par(
         threads,
         Q,
-        || DState { users: Vec::new(), camp: CampMap::default() },
+        || DState { users: Vec::new(), camp: CampDays::new(ncamp, d0, nd) },
         |st, q| {
             // Group by person in linear time: dense local person ids from a flat
             // table, a counting-sort scatter, then sort each person's few rows.
@@ -1264,7 +1284,7 @@ fn main() {
                     } else {
                         organic
                     };
-                    let a = st.camp.entry((credited, sess[k].day)).or_insert([0; 4]);
+                    let a = st.camp.at(credited, sess[k].day);
                     a[0] += 1;
                     a[1] += sess[k].purch as i64;
                     a[2] += sess[k].revenue;
@@ -1288,15 +1308,22 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
-    let mut camp_all: CampMap = CampMap::default();
+    let mut camp_all = CampDays::new(ncamp, d0, nd);
     for d in &dstates {
-        for (k, v) in &d.camp {
-            let a = camp_all.entry(*k).or_insert([0; 4]);
+        for (a, v) in camp_all.v.iter_mut().zip(&d.camp.v) {
             for i in 0..4 {
                 a[i] += v[i];
             }
         }
     }
+    let camp_rows: Vec<((u32, i32), [i64; 4])> = camp_all
+        .v
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a[0] > 0 || a[3] > 0)
+        .map(|(i, a)| (((i / nd) as u32, d0 + (i % nd) as i32), *a))
+        .collect();
+    let camp_rows = &camp_rows;
     let dstates_ref = &dstates;
     let cat_names = &cat_names;
     let (camp_ids, camp_channels) = (&camp_ids, &camp_channels);
@@ -1332,7 +1359,7 @@ fn main() {
             ];
             parquet::write(&ud.join(format!("part-{i:03}.parquet")), &cols).expect("write user_daily");
         } else {
-            let rows: Vec<(&(u32, i32), &[i64; 4])> = camp_all.iter().collect();
+            let rows = camp_rows;
             let cols = vec![
                 ("campaign_id", parquet::Col::Str(rows.iter().map(|r| camp_ids[r.0 .0 as usize]).collect())),
                 ("channel", parquet::Col::Str(rows.iter().map(|r| camp_channels[r.0 .0 as usize]).collect())),
