@@ -251,6 +251,125 @@ fn fields<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
     n == N
 }
 
+/// Bitmasks of commas, newlines and quotes in the 64 bytes at `p`.
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let m = |c: u8| {
+            let s = _mm256_set1_epi8(c as i8);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, s)) as u32 as u64;
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, s)) as u32 as u64;
+            lo | (hi << 32)
+        };
+        (m(b','), m(b'\n'), m(b'"'))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+        for i in 0..64 {
+            let x = *p.add(i);
+            c |= ((x == b',') as u64) << i;
+            n |= ((x == b'\n') as u64) << i;
+            q |= ((x == b'"') as u64) << i;
+        }
+        (c, n, q)
+    }
+}
+
+/// Calls `on_line` with the N unquoted fields of every well-formed line of
+/// `body` (the CSV dialect: every comma separates, only `\n` ends a line, a
+/// quote may only wrap a whole field). Same results as `fields` per line, but
+/// finds every separator and quote with 64-byte SIMD masks in one pass: since
+/// no value holds a comma or newline, quotes never change where fields split.
+#[inline(always)]
+#[allow(unused_assignments)]
+fn scan<'a, const N: usize>(body: &'a [u8], mut on_line: impl FnMut(&[&'a [u8]; N])) {
+    let len = body.len();
+    let mut f: [&'a [u8]; N] = [&[]; N];
+    let mut nf = 0usize; // fields ended in this line
+    let mut bad = false;
+    let mut fstart = 0usize;
+    let (mut qn, mut qfirst, mut qlast) = (0u32, 0usize, 0usize);
+    let mut tail = [0u8; 64];
+    let mut base = 0usize;
+    macro_rules! quotes {
+        ($m:expr) => {{
+            let m: u64 = $m;
+            if qn == 0 {
+                qfirst = base + m.trailing_zeros() as usize;
+            }
+            qn += m.count_ones();
+            qlast = base + 63 - m.leading_zeros() as usize;
+        }};
+    }
+    macro_rules! end_field {
+        ($p:expr) => {{
+            let p: usize = $p;
+            if nf < N {
+                if qn == 0 {
+                    f[nf] = &body[fstart..p];
+                } else if qn == 2 && qfirst == fstart && qlast + 1 == p {
+                    f[nf] = &body[fstart + 1..p - 1];
+                } else {
+                    bad = true;
+                }
+            }
+            nf += 1;
+            fstart = p + 1;
+            qn = 0;
+        }};
+    }
+    macro_rules! end_line {
+        () => {{
+            if !bad && nf == N {
+                on_line(&f);
+            }
+            nf = 0;
+            bad = false;
+        }};
+    }
+    while base < len {
+        let (cm, nm, mut qm) = if base + 64 <= len {
+            unsafe { masks64(body.as_ptr().add(base)) }
+        } else {
+            let n = len - base;
+            tail = [0u8; 64];
+            tail[..n].copy_from_slice(&body[base..]);
+            let (c, nl, q) = unsafe { masks64(tail.as_ptr()) };
+            let valid = (1u64 << n) - 1;
+            (c & valid, nl & valid, q & valid)
+        };
+        let mut sep = cm | nm;
+        while sep != 0 {
+            let off = sep.trailing_zeros() as usize;
+            let below = qm & ((1u64 << off) - 1);
+            if below != 0 {
+                quotes!(below);
+                qm &= !below;
+            }
+            end_field!(base + off);
+            if (nm >> off) & 1 == 1 {
+                end_line!();
+            }
+            sep &= sep - 1;
+        }
+        if qm != 0 {
+            quotes!(qm);
+        }
+        base += 64;
+    }
+    // A last line without its newline.
+    if fstart < len || nf > 0 {
+        end_field!(len);
+        end_line!();
+    }
+    let _ = tail;
+}
+
 // ---------------------------------------------------------------- timestamps
 
 #[inline]
@@ -615,10 +734,9 @@ fn main() {
             let body: &[u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
             match kind {
                 0 => {
-                    for line in body.split(|&c| c == b'\n') {
-                        let mut f = [&b""[..]; 7];
-                        if !fields(line, &mut f) || f[0].is_empty() {
-                            continue;
+                    scan::<7>(body, |f| {
+                        if f[0].is_empty() {
+                            return;
                         }
                         let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
                         let eid = key(f[0]);
@@ -648,30 +766,28 @@ fn main() {
                             }
                         }
                         st.ev[part_of(eid, P)].push(ev);
-                    }
+                    });
                 }
                 1 => {
-                    for line in body.split(|&c| c == b'\n') {
-                        let mut f = [&b""[..]; 4];
-                        if !fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
-                            continue;
+                    scan::<4>(body, |f| {
+                        if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
+                            return;
                         }
-                        let Some(ts) = parse_ts(f[3]) else { continue };
+                        let Some(ts) = parse_ts(f[3]) else { return };
                         if ts < cw_lo || ts >= cw_hi {
-                            continue;
+                            return;
                         }
-                        let Some(camp) = camp_of.get(key(f[2])) else { continue };
+                        let Some(camp) = camp_of.get(key(f[2])) else { return };
                         st.ck.push(Ck { user: key(f[1]), cid: f[0], ts, camp });
-                    }
+                    });
                 }
                 _ => {
-                    for line in body.split(|&c| c == b'\n') {
-                        let mut f = [&b""[..]; 2];
-                        if !fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
-                            continue;
+                    scan::<2>(body, |f| {
+                        if f[0].is_empty() || f[1].is_empty() {
+                            return;
                         }
                         st.lk.push((f[0], f[1]));
-                    }
+                    });
                 }
             }
         },
