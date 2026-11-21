@@ -1,0 +1,16 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# No dependencies: CSV parsing, hashing, threading and the Parquet writer are
+# all in src/, so the image builds in seconds and starts instantly.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
