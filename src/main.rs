@@ -962,13 +962,16 @@ fn main() {
     // Reserve each person-partition buffer up front (about twice a thread's
     // fair share of events) so the scatter never reallocates and copies.
     let sv_reserve = ev_bytes / 64 / threads / Q * 2 + 16;
+    // Same for clicks (~40 bytes a click line).
+    let ck_bytes: usize = paths.iter().zip(&bufs).filter(|(p, _)| p.0 == 1).map(|(_, b)| b.len).sum();
+    let ck_reserve = ck_bytes / 40 / threads / Q * 2 + 16;
     let astates_ref = &astates;
     let cstates = par(
         threads,
         p_ev + nst,
         || CState {
             sv: (0..Q).map(|_| Vec::with_capacity(sv_reserve)).collect(),
-            ck: (0..Q).map(|_| Vec::new()).collect(),
+            ck: (0..Q).map(|_| Vec::with_capacity(ck_reserve)).collect(),
             rows: Vec::new(),
             tab: Vec::new(),
             win: Vec::new(),
