@@ -24,7 +24,6 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
-const P: usize = 256; // event_id partitions
 const Q: usize = 256; // person partitions
 
 // ------------------------------------------------------------------ hashing
@@ -848,7 +847,11 @@ fn main() {
     // Reserve each partition buffer up front (about twice a thread's fair share
     // at ~64 bytes per event line) so pushes never reallocate and copy.
     let ev_bytes: usize = paths.iter().zip(&bufs).filter(|(p, _)| p.0 == 0).map(|(_, b)| b.len).sum();
-    let ev_reserve = ev_bytes / 64 / threads / P * 2 + 16;
+    // event_id partitions: about 20K event lines each (~64 bytes a line), so a
+    // partition's rows and dedup table stay cache-sized as the input grows.
+    let prows: usize = 20_000;
+    let p_ev = (ev_bytes / 64 / prows).next_power_of_two().clamp(256, 8192);
+    let ev_reserve = ev_bytes / 64 / threads / p_ev * 2 + 16;
     let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
     let product_cat = &product_cat;
     let camp_of = &camp_of;
@@ -857,7 +860,7 @@ fn main() {
         let a = par(
             threads,
             chunk_list.len() - nlk,
-            || AState { ev: (0..P).map(|_| Vec::with_capacity(ev_reserve)).collect(), ck: Vec::new(), long: Vec::new() },
+            || AState { ev: (0..p_ev).map(|_| Vec::with_capacity(ev_reserve)).collect(), ck: Vec::new(), long: Vec::new() },
             |st, i| {
                 let (kind, ref sp) = chunk_list[i + nlk];
                 // The buffers live until main returns.
@@ -895,7 +898,7 @@ fn main() {
                                 }
                             }
                         }
-                        st.ev[part_of(eid, P)].push(ev);
+                        st.ev[part_of(eid, p_ev)].push(ev);
                     });
                 } else {
                     scan::<4>(body, |f| {
@@ -942,7 +945,7 @@ fn main() {
     let astates_ref = &astates;
     let cstates = par(
         threads,
-        P + nst,
+        p_ev + nst,
         || CState {
             sv: (0..Q).map(|_| Vec::new()).collect(),
             ck: (0..Q).map(|_| Vec::new()).collect(),
@@ -951,7 +954,7 @@ fn main() {
             win: Vec::new(),
         },
         |st, i| {
-            if i < P {
+            if i < p_ev {
                 let rows = &mut st.rows;
                 rows.clear();
                 for a in astates_ref {
@@ -996,7 +999,7 @@ fn main() {
                     st.sv[part_of(person, Q)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                 }
             } else {
-                let cks = &astates_ref[i - P].ck;
+                let cks = &astates_ref[i - p_ev].ck;
                 for w in 0..cks.len() {
                     if w + AHEAD < cks.len() {
                         pmap.prefetch(cks[w + AHEAD].user);
