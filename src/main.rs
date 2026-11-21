@@ -129,6 +129,41 @@ impl Table {
     }
 }
 
+/// Open-addressing map from linked ID key to person key; unlinked keys map to
+/// themselves.
+struct PersonMap {
+    e: Vec<(u128, u128)>,
+    mask: usize,
+}
+
+impl PersonMap {
+    #[inline(always)]
+    fn prefetch(&self, k: u128) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let p = self.e.as_ptr().add(hk(k) as usize & self.mask);
+            _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = k;
+    }
+    #[inline]
+    fn get(&self, k: u128) -> u128 {
+        let mut i = hk(k) as usize & self.mask;
+        loop {
+            let (x, p) = self.e[i];
+            if x == k {
+                return p;
+            }
+            if x == 0 {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- file data
 
 struct Buf {
@@ -874,13 +909,15 @@ fn main() {
             long_names.insert(k, s);
         }
     }
-    let (ids, pkey) = (&ids, &pkey);
-    let person_of = |u: u128| -> u128 {
-        match ids.get(u) {
-            Some(i) => pkey[i as usize],
-            None => u,
-        }
+    // Linked key -> person key in one 32-byte slot (same layout as `ids`), so a
+    // lookup is one memory access; callers prefetch slots ahead of use.
+    let pmap = PersonMap {
+        e: ids.e.iter().map(|&(k, i)| (k, if k == 0 { 0 } else { pkey[i as usize] })).collect(),
+        mask: ids.mask,
     };
+    drop(ids);
+    let pmap = &pmap;
+    let person_of = |u: u128| -> u128 { pmap.get(u) };
     log(&format!("links: {} ids", n));
 
     // -------------------------------------------------- phase C: dedup + repartition
@@ -889,7 +926,9 @@ fn main() {
         ck: Vec<Vec<Cp<'a>>>,
         rows: Vec<Ev>,
         tab: Vec<u32>,
+        win: Vec<u32>,
     }
+    const AHEAD: usize = 16; // prefetch distance for person lookups
     let nst = astates.len();
     let astates_ref = &astates;
     let cstates = par(
@@ -900,6 +939,7 @@ fn main() {
             ck: (0..Q).map(|_| Vec::new()).collect(),
             rows: Vec::new(),
             tab: Vec::new(),
+            win: Vec::new(),
         },
         |st, i| {
             if i < P {
@@ -931,19 +971,28 @@ fn main() {
                         s = (s + 1) & mask;
                     }
                 }
+                let win = &mut st.win;
+                win.clear();
                 for &j in tab.iter() {
-                    if j == u32::MAX {
-                        continue;
+                    if j != u32::MAX && rows[j as usize].kind != 0 {
+                        win.push(j);
                     }
-                    let r = &rows[j as usize];
-                    if r.kind == 0 {
-                        continue;
+                }
+                for w in 0..win.len() {
+                    if w + AHEAD < win.len() {
+                        pmap.prefetch(rows[win[w + AHEAD] as usize].user);
                     }
+                    let r = &rows[win[w] as usize];
                     let person = person_of(r.user);
                     st.sv[part_of(person, Q)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                 }
             } else {
-                for c in &astates_ref[i - P].ck {
+                let cks = &astates_ref[i - P].ck;
+                for w in 0..cks.len() {
+                    if w + AHEAD < cks.len() {
+                        pmap.prefetch(cks[w + AHEAD].user);
+                    }
+                    let c = &cks[w];
                     let person = person_of(c.user);
                     st.ck[part_of(person, Q)].push(Cp { person, cid: c.cid, ts: c.ts, camp: c.camp });
                 }
