@@ -70,6 +70,22 @@ fn key(s: &[u8]) -> u128 {
     }
 }
 
+/// `key(s)` for a slice that lies inside a buffer ending at address `end`:
+/// when 16 bytes from the slice start are readable, one unaligned load and a
+/// mask replace the variable-length copy. Same result as `key`.
+#[inline(always)]
+fn key_in(s: &[u8], end: usize) -> u128 {
+    let n = s.len();
+    if n <= 15 && s.as_ptr() as usize + 16 <= end {
+        // Safety: the 16 bytes at s.as_ptr() lie before `end`, inside the buffer.
+        let v = unsafe { (s.as_ptr() as *const u128).read_unaligned() }.swap_bytes();
+        let keep = if n == 0 { 0 } else { !0u128 << (8 * (16 - n)) };
+        (v & keep) | n as u128
+    } else {
+        key(s)
+    }
+}
+
 #[inline]
 fn is_long(k: u128) -> bool {
     (k as u8) > 15
@@ -865,13 +881,14 @@ fn main() {
                 let (kind, ref sp) = chunk_list[i + nlk];
                 // The buffers live until main returns.
                 let body: &'static [u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
+                let end = body.as_ptr() as usize + body.len();
                 if kind == 0 {
                     scan::<7>(body, |f| {
                         if f[0].is_empty() {
                             return;
                         }
                         let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                        let eid = key(f[0]);
+                        let eid = key_in(f[0], end);
                         let ingest_rel = (ingest.div_euclid(1000) - ingest_base).clamp(0, u32::MAX as i64) as u32;
                         let mut ev = Ev { eid, user: 0, ingest: ingest_rel, ts: 0, price: 0, cat: 0, kind: 0 };
                         if !f[1].is_empty() && !f[5].is_empty() {
@@ -885,7 +902,7 @@ fn main() {
                                 if ts >= ws && ts < we && k != 0 && ingest.saturating_sub(ts) <= DAY {
                                     let price = if k == 3 { parse_price(f[6]) } else { Some(0) };
                                     if let Some(price) = price {
-                                        let user = key(f[1]);
+                                        let user = key_in(f[1], end);
                                         if is_long(user) {
                                             st.long.push((user, f[1]));
                                         }
@@ -893,7 +910,7 @@ fn main() {
                                         ev.ts = (ts - ws) as u32;
                                         ev.kind = k;
                                         ev.price = price;
-                                        ev.cat = product_cat.get(key(f[5])).map(|c| c as u16).unwrap_or(unknown);
+                                        ev.cat = product_cat.get(key_in(f[5], end)).map(|c| c as u16).unwrap_or(unknown);
                                     }
                                 }
                             }
@@ -909,8 +926,8 @@ fn main() {
                         if ts < cw_lo || ts >= cw_hi {
                             return;
                         }
-                        let Some(camp) = camp_of.get(key(f[2])) else { return };
-                        st.ck.push(Ck { user: key(f[1]), cid: f[0], ts, camp });
+                        let Some(camp) = camp_of.get(key_in(f[2], end)) else { return };
+                        st.ck.push(Ck { user: key_in(f[1], end), cid: f[0], ts, camp });
                     });
                 }
             },
