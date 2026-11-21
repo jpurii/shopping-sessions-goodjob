@@ -845,6 +845,10 @@ fn main() {
         long: Vec<(u128, &'static [u8])>,
     }
     let (cw_lo, cw_hi) = (ws - WEEK, we);
+    // Reserve each partition buffer up front (about twice a thread's fair share
+    // at ~64 bytes per event line) so pushes never reallocate and copy.
+    let ev_bytes: usize = paths.iter().zip(&bufs).filter(|(p, _)| p.0 == 0).map(|(_, b)| b.len).sum();
+    let ev_reserve = ev_bytes / 64 / threads / P * 2 + 16;
     let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
     let product_cat = &product_cat;
     let camp_of = &camp_of;
@@ -853,7 +857,7 @@ fn main() {
         let a = par(
             threads,
             chunk_list.len() - nlk,
-            || AState { ev: (0..P).map(|_| Vec::new()).collect(), ck: Vec::new(), long: Vec::new() },
+            || AState { ev: (0..P).map(|_| Vec::with_capacity(ev_reserve)).collect(), ck: Vec::new(), long: Vec::new() },
             |st, i| {
                 let (kind, ref sp) = chunk_list[i + nlk];
                 // The buffers live until main returns.
