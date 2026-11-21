@@ -959,12 +959,15 @@ fn main() {
     }
     const AHEAD: usize = 16; // prefetch distance for person lookups
     let nst = astates.len();
+    // Reserve each person-partition buffer up front (about twice a thread's
+    // fair share of events) so the scatter never reallocates and copies.
+    let sv_reserve = ev_bytes / 64 / threads / Q * 2 + 16;
     let astates_ref = &astates;
     let cstates = par(
         threads,
         p_ev + nst,
         || CState {
-            sv: (0..Q).map(|_| Vec::new()).collect(),
+            sv: (0..Q).map(|_| Vec::with_capacity(sv_reserve)).collect(),
             ck: (0..Q).map(|_| Vec::new()).collect(),
             rows: Vec::new(),
             tab: Vec::new(),
