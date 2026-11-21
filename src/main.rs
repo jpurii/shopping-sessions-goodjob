@@ -1091,10 +1091,12 @@ fn main() {
     // Session start days lie in the event window: d0 ..= day of (window_end - 1 ms).
     let d0 = ws.div_euclid(DAY) as i32;
     let nd = ((we - 1).div_euclid(DAY) - ws.div_euclid(DAY) + 1).max(1) as usize;
+    // user_daily rows: about one per 10 event lines; reserve ~1.5x a thread's share.
+    let users_reserve = ev_bytes / 64 / 10 / threads * 3 / 2 + 16;
     let dstates = par(
         threads,
         Q,
-        || DState { users: Vec::new(), camp: CampDays::new(ncamp, d0, nd) },
+        || DState { users: Vec::with_capacity(users_reserve), camp: CampDays::new(ncamp, d0, nd) },
         |st, q| {
             // Group by person in linear time: dense local person ids from a flat
             // table, a counting-sort scatter, then sort each person's few rows.
