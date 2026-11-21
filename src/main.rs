@@ -1,18 +1,22 @@
 //! Shopping Sessions pipeline (rules.md), one native pass with no dependencies.
 //!
+//! Every ID (event, user, product, campaign) becomes an exact 128-bit key: IDs
+//! up to 15 bytes are packed big-endian with their length in the last byte, so
+//! key order is byte order; longer IDs get a 120-bit hash (and keep their bytes
+//! where we need order or output). Hash tables are flat open-addressing arrays.
+//!
 //! Phase A  parse every CSV chunk in parallel: events (partitioned by event_id),
 //!          valid clicks, link pairs.
-//! Phase B  union-find over the links; each ID maps to its person's name.
+//! Phase B  union-find over the links; each linked key maps to its person's key.
 //! Phase C  dedup events per event_id partition (earliest ingest_ts wins, then
 //!          validity of that copy decides), map events and clicks to persons and
 //!          repartition both by person.
-//! Phase D  per person partition: sessionize, credit, assists, daily rows.
+//! Phase D  per person partition: sort, sessionize, credit, assists, daily rows.
 //! Phase E  write both tables as Parquet.
 
 mod parquet;
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -35,9 +39,8 @@ fn mum(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-#[inline]
-fn hash_bytes(b: &[u8]) -> u64 {
-    let mut h = (b.len() as u64) ^ K0;
+fn hash_bytes(b: &[u8], seed: u64) -> u64 {
+    let mut h = (b.len() as u64) ^ seed;
     let mut it = b.chunks_exact(8);
     for c in &mut it {
         h = mum(h ^ u64::from_le_bytes(c.try_into().unwrap()), K1);
@@ -51,45 +54,80 @@ fn hash_bytes(b: &[u8]) -> u64 {
     mum(h, K1 ^ K2)
 }
 
-/// Partition index, from bits independent of the ones hash maps use.
+/// Exact key of a non-empty ID. Short IDs (<= 15 bytes): bytes big-endian, then
+/// the length, so comparing keys compares bytes. Long IDs: low byte 0xFF.
 #[inline]
-fn part(b: &[u8], n: usize) -> usize {
-    ((mum(hash_bytes(b), K0) >> 32) as usize) % n
+fn key(s: &[u8]) -> u128 {
+    let n = s.len();
+    if n <= 15 {
+        let mut b = [0u8; 16];
+        b[..n].copy_from_slice(s);
+        b[15] = n as u8;
+        u128::from_be_bytes(b)
+    } else {
+        let h1 = hash_bytes(s, K0) as u128;
+        let h2 = hash_bytes(s, K2) as u128;
+        (h1 << 64) | (h2 << 8) | 0xFF
+    }
 }
 
-#[derive(Default, Clone, Copy)]
-struct FastHasher(u64);
-impl Hasher for FastHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
+#[inline]
+fn is_long(k: u128) -> bool {
+    (k as u8) > 15
+}
+
+/// Bytes of a short key.
+#[inline]
+fn unpack(k: u128, out: &mut Vec<u8>) {
+    let b = k.to_be_bytes();
+    out.extend_from_slice(&b[..b[15] as usize]);
+}
+
+#[inline(always)]
+fn hk(k: u128) -> u64 {
+    mum((k as u64) ^ K0, ((k >> 64) as u64) ^ K1)
+}
+
+#[inline(always)]
+fn part_of(k: u128, n: usize) -> usize {
+    ((hk(k) >> 32) as usize * n) >> 32
+}
+
+/// Open-addressing map from non-zero keys to u32.
+struct Table {
+    e: Vec<(u128, u32)>,
+    mask: usize,
+}
+
+impl Table {
+    fn with_cap(n: usize) -> Table {
+        let cap = (n.max(8) * 2).next_power_of_two();
+        Table { e: vec![(0, 0); cap], mask: cap - 1 }
     }
     #[inline]
-    fn write(&mut self, b: &[u8]) {
-        self.0 = mum(self.0 ^ hash_bytes(b), K1);
+    fn slot(&self, k: u128) -> usize {
+        let mut i = hk(k) as usize & self.mask;
+        loop {
+            let x = self.e[i].0;
+            if x == k || x == 0 {
+                return i;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
     #[inline]
-    fn write_u8(&mut self, v: u8) {
-        self.0 = mum(self.0 ^ v as u64 ^ K2, K1);
-    }
-    #[inline]
-    fn write_u32(&mut self, v: u32) {
-        self.0 = mum(self.0 ^ v as u64 ^ K2, K1);
-    }
-    #[inline]
-    fn write_i32(&mut self, v: i32) {
-        self.0 = mum(self.0 ^ v as u32 as u64 ^ K0, K1);
-    }
-    #[inline]
-    fn write_u64(&mut self, v: u64) {
-        self.0 = mum(self.0 ^ v ^ K2, K1);
-    }
-    #[inline]
-    fn write_usize(&mut self, v: usize) {
-        self.0 = mum(self.0 ^ v as u64 ^ K0, K2);
+    fn get(&self, k: u128) -> Option<u32> {
+        if k == 0 {
+            return None;
+        }
+        let e = self.e[self.slot(k)];
+        if e.0 == k {
+            Some(e.1)
+        } else {
+            None
+        }
     }
 }
-type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 // ---------------------------------------------------------------- file data
 
@@ -340,12 +378,13 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 
 // ------------------------------------------------------------------ records
 
+/// One parsed event copy. `kind` 0 = invalid (only `eid` and `ingest` matter).
 #[derive(Clone, Copy)]
-struct Ev<'a> {
-    eid: &'a [u8],
-    user: &'a [u8],
+struct Ev {
+    eid: u128,
+    user: u128,
     ingest: i64,
-    ts: i64,
+    ts: u32, // ms since window_start
     price: u32,
     cat: u16,
     kind: u8, // 0 invalid, 1 view, 2 cart, 3 purchase
@@ -353,16 +392,16 @@ struct Ev<'a> {
 
 #[derive(Clone, Copy)]
 struct Ck<'a> {
+    user: u128,
     cid: &'a [u8],
-    user: &'a [u8],
     ts: i64,
     camp: u32,
 }
 
 #[derive(Clone, Copy)]
-struct Sv<'a> {
-    person: &'a [u8],
-    ts: i64,
+struct Sv {
+    person: u128,
+    ts: u32,
     price: u32,
     cat: u16,
     kind: u8,
@@ -370,7 +409,7 @@ struct Sv<'a> {
 
 #[derive(Clone, Copy)]
 struct Cp<'a> {
-    person: &'a [u8],
+    person: u128,
     cid: &'a [u8],
     ts: i64,
     camp: u32,
@@ -384,8 +423,10 @@ struct Sess {
     purch: bool,
 }
 
+type CampMap = HashMap<(u32, i32), [i64; 4]>;
+
 /// Campaign `c` assisted sessions a..b (in start order): add them per day.
-fn assists(camp: &mut FastMap<(u32, i32), [i64; 4]>, sess: &[Sess], dend: &[usize], c: u32, a: usize, b: usize) {
+fn assists(camp: &mut CampMap, sess: &[Sess], dend: &[usize], c: u32, a: usize, b: usize) {
     let mut i = a;
     while i < b {
         let e = dend[i].min(b);
@@ -394,8 +435,8 @@ fn assists(camp: &mut FastMap<(u32, i32), [i64; 4]>, sess: &[Sess], dend: &[usiz
     }
 }
 
-struct UserRow<'a> {
-    person: &'a [u8],
+struct UserRow {
+    person: u128,
     day: i32,
     sessions: i64,
     events: i64,
@@ -449,6 +490,11 @@ fn find_json_str<'a>(json: &'a [u8], key: &str) -> &'a [u8] {
     &rest[q1..q2]
 }
 
+fn body_lines(b: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let body = memchr(b'\n', b).map(|p| &b[p + 1..]).unwrap_or(&[]);
+    body.split(|&c| c == b'\n')
+}
+
 fn main() {
     let t0 = Instant::now();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -469,22 +515,22 @@ fn main() {
     let products_buf = load(&data.join("products.csv"));
     let campaigns_buf = load(&data.join("campaigns.csv"));
     let mut cat_names: Vec<&[u8]> = Vec::new();
-    let mut cat_of_name: FastMap<&[u8], u16> = FastMap::default();
-    let mut product_cat: FastMap<&[u8], u16> = FastMap::default();
-    {
-        let b = products_buf.bytes();
-        let body = memchr(b'\n', b).map(|p| &b[p + 1..]).unwrap_or(&[]);
-        for line in body.split(|&c| c == b'\n') {
-            let mut f = [&b""[..]; 2];
-            if !fields(line, &mut f) {
-                continue;
-            }
-            let next = cat_names.len() as u16;
-            let c = *cat_of_name.entry(f[1]).or_insert_with(|| {
-                cat_names.push(f[1]);
-                next
-            });
-            product_cat.entry(f[0]).or_insert(c);
+    let mut cat_of_name: HashMap<&[u8], u16> = HashMap::new();
+    let nprod = body_lines(products_buf.bytes()).count();
+    let mut product_cat = Table::with_cap(nprod);
+    for line in body_lines(products_buf.bytes()) {
+        let mut f = [&b""[..]; 2];
+        if !fields(line, &mut f) || f[0].is_empty() {
+            continue;
+        }
+        let next = cat_names.len() as u16;
+        let c = *cat_of_name.entry(f[1]).or_insert_with(|| {
+            cat_names.push(f[1]);
+            next
+        });
+        let s = product_cat.slot(key(f[0]));
+        if product_cat.e[s].0 == 0 {
+            product_cat.e[s] = (key(f[0]), c as u32);
         }
     }
     let unknown = cat_names.len() as u16;
@@ -499,20 +545,19 @@ fn main() {
 
     let mut camp_ids: Vec<&[u8]> = Vec::new();
     let mut camp_channels: Vec<&[u8]> = Vec::new();
-    let mut camp_of: FastMap<&[u8], u32> = FastMap::default();
-    {
-        let b = campaigns_buf.bytes();
-        let body = memchr(b'\n', b).map(|p| &b[p + 1..]).unwrap_or(&[]);
-        for line in body.split(|&c| c == b'\n') {
-            let mut f = [&b""[..]; 2];
-            if !fields(line, &mut f) || f[0].is_empty() {
-                continue;
-            }
-            if !camp_of.contains_key(f[0]) {
-                camp_of.insert(f[0], camp_ids.len() as u32);
-                camp_ids.push(f[0]);
-                camp_channels.push(f[1]);
-            }
+    let ncampl = body_lines(campaigns_buf.bytes()).count();
+    let mut camp_of = Table::with_cap(ncampl);
+    for line in body_lines(campaigns_buf.bytes()) {
+        let mut f = [&b""[..]; 2];
+        if !fields(line, &mut f) || f[0].is_empty() {
+            continue;
+        }
+        let k = key(f[0]);
+        let s = camp_of.slot(k);
+        if camp_of.e[s].0 == 0 {
+            camp_of.e[s] = (k, camp_ids.len() as u32);
+            camp_ids.push(f[0]);
+            camp_channels.push(f[1]);
         }
     }
     let organic = camp_ids.len() as u32;
@@ -542,14 +587,20 @@ fn main() {
     for (i, (kind, _)) in paths.iter().enumerate() {
         chunks(bufs[i].bytes(), 8 << 20, &mut raw_chunks, *kind);
     }
+    // Links first so the (single-threaded) union-find input is ready early.
+    raw_chunks.sort_by_key(|c| match c.0 {
+        2 => 0,
+        k => k + 1,
+    });
     let chunk_list: Vec<(u8, SendPtr)> = raw_chunks.into_iter().map(|(k, p, l)| (k, SendPtr(p, l))).collect();
     log(&format!("{} files, {} chunks, {} threads", paths.len(), chunk_list.len(), threads));
 
     // -------------------------------------------------- phase A: parse
     struct AState<'a> {
-        ev: Vec<Vec<Ev<'a>>>,
+        ev: Vec<Vec<Ev>>,
         ck: Vec<Ck<'a>>,
         lk: Vec<(&'a [u8], &'a [u8])>,
+        long: Vec<(u128, &'a [u8])>,
     }
     let (cw_lo, cw_hi) = (ws - WEEK, we);
     let product_cat = &product_cat;
@@ -557,7 +608,7 @@ fn main() {
     let astates = par(
         threads,
         chunk_list.len(),
-        || AState { ev: (0..P).map(|_| Vec::new()).collect(), ck: Vec::new(), lk: Vec::new() },
+        || AState { ev: (0..P).map(|_| Vec::new()).collect(), ck: Vec::new(), lk: Vec::new(), long: Vec::new() },
         |st, i| {
             let (kind, ref sp) = chunk_list[i];
             // The buffers live until main returns.
@@ -570,7 +621,8 @@ fn main() {
                             continue;
                         }
                         let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                        let mut ev = Ev { eid: f[0], user: f[1], ingest, ts: 0, price: 0, cat: 0, kind: 0 };
+                        let eid = key(f[0]);
+                        let mut ev = Ev { eid, user: 0, ingest, ts: 0, price: 0, cat: 0, kind: 0 };
                         if !f[1].is_empty() && !f[5].is_empty() {
                             if let Some(ts) = parse_ts(f[2]) {
                                 let k = match f[4] {
@@ -582,29 +634,34 @@ fn main() {
                                 if ts >= ws && ts < we && k != 0 && ingest.saturating_sub(ts) <= DAY {
                                     let price = if k == 3 { parse_price(f[6]) } else { Some(0) };
                                     if let Some(price) = price {
-                                        ev.ts = ts;
+                                        let user = key(f[1]);
+                                        if is_long(user) {
+                                            st.long.push((user, f[1]));
+                                        }
+                                        ev.user = user;
+                                        ev.ts = (ts - ws) as u32;
                                         ev.kind = k;
                                         ev.price = price;
-                                        ev.cat = *product_cat.get(f[5]).unwrap_or(&unknown);
+                                        ev.cat = product_cat.get(key(f[5])).map(|c| c as u16).unwrap_or(unknown);
                                     }
                                 }
                             }
                         }
-                        st.ev[part(f[0], P)].push(ev);
+                        st.ev[part_of(eid, P)].push(ev);
                     }
                 }
                 1 => {
                     for line in body.split(|&c| c == b'\n') {
                         let mut f = [&b""[..]; 4];
-                        if !fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+                        if !fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
                             continue;
                         }
                         let Some(ts) = parse_ts(f[3]) else { continue };
                         if ts < cw_lo || ts >= cw_hi {
                             continue;
                         }
-                        let Some(&camp) = camp_of.get(f[2]) else { continue };
-                        st.ck.push(Ck { cid: f[0], user: f[1], ts, camp });
+                        let Some(camp) = camp_of.get(key(f[2])) else { continue };
+                        st.ck.push(Ck { user: key(f[1]), cid: f[0], ts, camp });
                     }
                 }
                 _ => {
@@ -622,9 +679,11 @@ fn main() {
     log("parsed");
 
     // -------------------------------------------------- phase B: links
-    let mut id_of: FastMap<&[u8], u32> = FastMap::default();
-    let mut names: Vec<&[u8]> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
+    let nsides: usize = astates.iter().map(|s| s.lk.len() * 2).sum();
+    let mut ids = Table::with_cap(nsides);
+    let mut names: Vec<&[u8]> = Vec::with_capacity(nsides);
+    let mut keys: Vec<u128> = Vec::with_capacity(nsides);
+    let mut parent: Vec<u32> = Vec::with_capacity(nsides);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let p = parent[x as usize];
@@ -635,12 +694,20 @@ fn main() {
     }
     for st in &astates {
         for &(a, b) in &st.lk {
-            let mut id = |s: &'_ [u8]| -> u32 {
-                *id_of.entry(unsafe { std::mem::transmute::<&[u8], &[u8]>(s) }).or_insert_with(|| {
+            let mut id = |s: &[u8]| -> u32 {
+                let k = key(s);
+                let i = ids.slot(k);
+                if ids.e[i].0 == 0 {
+                    let n = names.len() as u32;
+                    ids.e[i] = (k, n);
+                    // Safety: the slice borrows an input buffer that lives until main returns.
                     names.push(unsafe { std::mem::transmute::<&[u8], &[u8]>(s) });
-                    parent.push(parent.len() as u32);
-                    (names.len() - 1) as u32
-                })
+                    keys.push(k);
+                    parent.push(n);
+                    n
+                } else {
+                    ids.e[i].1
+                }
             };
             let ia = id(a);
             let ib = id(b);
@@ -651,28 +718,47 @@ fn main() {
             }
         }
     }
-    let mut best: Vec<u32> = (0..names.len() as u32).collect();
-    for i in 0..names.len() as u32 {
+    let n = names.len();
+    let mut best: Vec<u32> = (0..n as u32).collect();
+    for i in 0..n as u32 {
         let r = find(&mut parent, i);
         if names[i as usize] < names[best[r as usize] as usize] {
             best[r as usize] = i;
         }
     }
-    let mut person_of: FastMap<&[u8], &[u8]> = FastMap::default();
-    person_of.reserve(names.len());
-    for i in 0..names.len() as u32 {
-        let r = find(&mut parent, i);
-        person_of.insert(names[i as usize], names[best[r as usize] as usize]);
+    // pkey[i] = key of ID i's person's name.
+    let mut pkey: Vec<u128> = vec![0; n];
+    for i in 0..n {
+        let r = find(&mut parent, i as u32);
+        pkey[i] = keys[best[r as usize] as usize];
     }
-    let person_of = &person_of;
-    log(&format!("links: {} ids", names.len()));
+    // Bytes of every long key that can name a person.
+    let mut long_names: HashMap<u128, &[u8]> = HashMap::new();
+    for i in 0..n {
+        if is_long(keys[i]) {
+            long_names.insert(keys[i], names[i]);
+        }
+    }
+    for st in &astates {
+        for &(k, s) in &st.long {
+            long_names.insert(k, s);
+        }
+    }
+    let (ids, pkey) = (&ids, &pkey);
+    let person_of = |u: u128| -> u128 {
+        match ids.get(u) {
+            Some(i) => pkey[i as usize],
+            None => u,
+        }
+    };
+    log(&format!("links: {} ids", n));
 
     // -------------------------------------------------- phase C: dedup + repartition
     struct CState<'a> {
-        sv: Vec<Vec<Sv<'a>>>,
+        sv: Vec<Vec<Sv>>,
         ck: Vec<Vec<Cp<'a>>>,
-        rows: Vec<&'a Ev<'a>>,
-        best: FastMap<&'a [u8], u32>,
+        rows: Vec<Ev>,
+        tab: Vec<u32>,
     }
     let nst = astates.len();
     let astates_ref = &astates;
@@ -683,46 +769,53 @@ fn main() {
             sv: (0..Q).map(|_| Vec::new()).collect(),
             ck: (0..Q).map(|_| Vec::new()).collect(),
             rows: Vec::new(),
-            best: FastMap::default(),
+            tab: Vec::new(),
         },
         |st, i| {
-            fn person<'a>(m: &FastMap<&'a [u8], &'a [u8]>, u: &'a [u8]) -> &'a [u8] {
-                m.get(u).copied().unwrap_or(u)
-            }
-            let lookup = |u| person(person_of, u);
             if i < P {
-                let rows: &mut Vec<&Ev> = unsafe { std::mem::transmute(&mut st.rows) };
+                let rows = &mut st.rows;
                 rows.clear();
                 for a in astates_ref {
-                    rows.extend(a.ev[i].iter());
+                    rows.extend_from_slice(&a.ev[i]);
                 }
-                let best: &mut FastMap<&[u8], u32> = unsafe { std::mem::transmute(&mut st.best) };
-                best.clear();
-                best.reserve(rows.len());
-                for (j, r) in rows.iter().enumerate() {
-                    match best.entry(r.eid) {
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(j as u32);
+                let cap = (rows.len().max(8) * 2).next_power_of_two();
+                let mask = cap - 1;
+                let tab = &mut st.tab;
+                tab.clear();
+                tab.resize(cap, u32::MAX);
+                for j in 0..rows.len() {
+                    let k = rows[j].eid;
+                    let mut s = hk(k) as usize & mask;
+                    loop {
+                        let v = tab[s];
+                        if v == u32::MAX {
+                            tab[s] = j as u32;
+                            break;
                         }
-                        std::collections::hash_map::Entry::Occupied(mut o) => {
-                            if r.ingest < rows[*o.get() as usize].ingest {
-                                o.insert(j as u32);
+                        if rows[v as usize].eid == k {
+                            if rows[j].ingest < rows[v as usize].ingest {
+                                tab[s] = j as u32;
                             }
+                            break;
                         }
+                        s = (s + 1) & mask;
                     }
                 }
-                for &j in best.values() {
-                    let r = rows[j as usize];
+                for &j in tab.iter() {
+                    if j == u32::MAX {
+                        continue;
+                    }
+                    let r = &rows[j as usize];
                     if r.kind == 0 {
                         continue;
                     }
-                    let person = lookup(r.user);
-                    st.sv[part(person, Q)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                    let person = person_of(r.user);
+                    st.sv[part_of(person, Q)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                 }
             } else {
                 for c in &astates_ref[i - P].ck {
-                    let person = lookup(c.user);
-                    st.ck[part(person, Q)].push(Cp { person, cid: c.cid, ts: c.ts, camp: c.camp });
+                    let person = person_of(c.user);
+                    st.ck[part_of(person, Q)].push(Cp { person, cid: c.cid, ts: c.ts, camp: c.camp });
                 }
             }
         },
@@ -730,9 +823,9 @@ fn main() {
     log("deduped");
 
     // -------------------------------------------------- phase D: sessions
-    struct DState<'a> {
-        users: Vec<UserRow<'a>>,
-        camp: FastMap<(u32, i32), [i64; 4]>,
+    struct DState {
+        users: Vec<UserRow>,
+        camp: CampMap,
     }
     let cstates_ref = &cstates;
     let rank = &rank;
@@ -740,31 +833,18 @@ fn main() {
     let dstates = par(
         threads,
         Q,
-        || DState { users: Vec::new(), camp: FastMap::default() },
+        || DState { users: Vec::new(), camp: CampMap::default() },
         |st, q| {
-            let mut pid_of: FastMap<&[u8], u32> = FastMap::default();
-            let mut persons: Vec<&[u8]> = Vec::new();
-            let mut evs: Vec<(u32, i64, u32, u16, u8)> = Vec::new();
+            let mut evs: Vec<Sv> = Vec::with_capacity(cstates_ref.iter().map(|c| c.sv[q].len()).sum());
             for c in cstates_ref {
-                for s in &c.sv[q] {
-                    let next = persons.len() as u32;
-                    let id = *pid_of.entry(s.person).or_insert_with(|| {
-                        persons.push(s.person);
-                        next
-                    });
-                    evs.push((id, s.ts, s.price, s.cat, s.kind));
-                }
+                evs.extend_from_slice(&c.sv[q]);
             }
-            let mut cks: Vec<(u32, i64, &[u8], u32)> = Vec::new();
+            let mut cks: Vec<Cp> = Vec::with_capacity(cstates_ref.iter().map(|c| c.ck[q].len()).sum());
             for c in cstates_ref {
-                for k in &c.ck[q] {
-                    if let Some(&id) = pid_of.get(k.person) {
-                        cks.push((id, k.ts, k.cid, k.camp));
-                    }
-                }
+                cks.extend_from_slice(&c.ck[q]);
             }
-            evs.sort_unstable_by_key(|e| (e.0, e.1));
-            cks.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+            evs.sort_unstable_by_key(|e| (e.person, e.ts));
+            cks.sort_unstable_by(|a, b| (a.person, a.ts, a.cid).cmp(&(b.person, b.ts, b.cid)));
 
             let mut sess: Vec<Sess> = Vec::new();
             let mut dend: Vec<usize> = Vec::new();
@@ -774,21 +854,49 @@ fn main() {
             let mut since = vec![0usize; ncamp];
             let mut touched: Vec<u32> = Vec::new();
 
+            let flush = |row: &mut Option<UserRow>, catsum: &mut Vec<i64>, touched_cats: &mut Vec<u16>, users: &mut Vec<UserRow>| {
+                if let Some(mut r) = row.take() {
+                    let mut top: Option<u16> = None;
+                    for &c in touched_cats.iter() {
+                        let v = catsum[c as usize];
+                        if v == 0 {
+                            continue;
+                        }
+                        top = match top {
+                            None => Some(c),
+                            Some(t) => {
+                                let tv = catsum[t as usize];
+                                if v > tv || (v == tv && rank[c as usize] < rank[t as usize]) {
+                                    Some(c)
+                                } else {
+                                    Some(t)
+                                }
+                            }
+                        };
+                    }
+                    for &c in touched_cats.iter() {
+                        catsum[c as usize] = 0;
+                    }
+                    touched_cats.clear();
+                    r.top = top;
+                    users.push(r);
+                }
+            };
+
             let (mut ei, mut ci) = (0usize, 0usize);
             while ei < evs.len() {
-                let pid = evs[ei].0;
+                let person = evs[ei].person;
                 let mut ej = ei;
-                while ej < evs.len() && evs[ej].0 == pid {
+                while ej < evs.len() && evs[ej].person == person {
                     ej += 1;
                 }
-                while ci < cks.len() && cks[ci].0 < pid {
+                while ci < cks.len() && cks[ci].person < person {
                     ci += 1;
                 }
                 let mut cj = ci;
-                while cj < cks.len() && cks[cj].0 == pid {
+                while cj < cks.len() && cks[cj].person == person {
                     cj += 1;
                 }
-                let person = persons[pid as usize];
                 let evp = &evs[ei..ej];
                 let ckp = &cks[ci..cj];
                 ei = ej;
@@ -798,36 +906,8 @@ fn main() {
                 sess.clear();
                 let mut prev = i64::MIN;
                 let mut row: Option<UserRow> = None;
-                let flush = |row: &mut Option<UserRow<'_>>, catsum: &mut Vec<i64>, touched_cats: &mut Vec<u16>, users: &mut Vec<UserRow<'_>>| {
-                    if let Some(mut r) = row.take() {
-                        let mut top: Option<u16> = None;
-                        for &c in touched_cats.iter() {
-                            let v = catsum[c as usize];
-                            if v == 0 {
-                                continue;
-                            }
-                            top = match top {
-                                None => Some(c),
-                                Some(t) => {
-                                    let tv = catsum[t as usize];
-                                    if v > tv || (v == tv && rank[c as usize] < rank[t as usize]) {
-                                        Some(c)
-                                    } else {
-                                        Some(t)
-                                    }
-                                }
-                            };
-                        }
-                        for &c in touched_cats.iter() {
-                            catsum[c as usize] = 0;
-                        }
-                        touched_cats.clear();
-                        r.top = top;
-                        // Safety: rows borrow input buffers that outlive main's work.
-                        users.push(unsafe { std::mem::transmute::<UserRow<'_>, UserRow<'_>>(r) });
-                    }
-                };
-                for &(_, ts, price, cat, kind) in evp {
+                for e in evp {
+                    let ts = ws + e.ts as i64;
                     if sess.is_empty() || ts - prev > GAP {
                         let day = ts.div_euclid(DAY) as i32;
                         sess.push(Sess { start: ts, day, revenue: 0, purch: false });
@@ -840,15 +920,16 @@ fn main() {
                     prev = ts;
                     let r = row.as_mut().unwrap();
                     r.events += 1;
-                    if kind == 3 {
-                        r.revenue += price as i64;
+                    if e.kind == 3 {
+                        let price = e.price as i64;
+                        r.revenue += price;
                         let s = sess.last_mut().unwrap();
-                        s.revenue += price as i64;
+                        s.revenue += price;
                         s.purch = true;
-                        if catsum[cat as usize] == 0 {
-                            touched_cats.push(cat);
+                        if catsum[e.cat as usize] == 0 {
+                            touched_cats.push(e.cat);
                         }
-                        catsum[cat as usize] += price as i64;
+                        catsum[e.cat as usize] += price;
                     }
                 }
                 flush(&mut row, &mut catsum, &mut touched_cats, &mut st.users);
@@ -863,8 +944,8 @@ fn main() {
                 let (mut lo, mut hi) = (0usize, 0usize);
                 for k in 0..n {
                     let s = sess[k].start;
-                    while hi < ckp.len() && ckp[hi].1 <= s {
-                        let c = ckp[hi].3 as usize;
+                    while hi < ckp.len() && ckp[hi].ts <= s {
+                        let c = ckp[hi].camp as usize;
                         if cnt[c] == 0 {
                             since[c] = k;
                             touched.push(c as u32);
@@ -872,8 +953,8 @@ fn main() {
                         cnt[c] += 1;
                         hi += 1;
                     }
-                    while lo < hi && ckp[lo].1 < s - WEEK {
-                        let c = ckp[lo].3 as usize;
+                    while lo < hi && ckp[lo].ts < s - WEEK {
+                        let c = ckp[lo].camp as usize;
                         cnt[c] -= 1;
                         if cnt[c] == 0 {
                             assists(&mut st.camp, &sess, &dend, c as u32, since[c], k);
@@ -882,11 +963,11 @@ fn main() {
                     }
                     let credited = if lo < hi {
                         let mut j = hi - 1;
-                        let t = ckp[j].1;
-                        while j > lo && ckp[j - 1].1 == t {
+                        let t = ckp[j].ts;
+                        while j > lo && ckp[j - 1].ts == t {
                             j -= 1;
                         }
-                        ckp[j].3
+                        ckp[j].camp
                     } else {
                         organic
                     };
@@ -914,7 +995,7 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
 
-    let mut camp_all: FastMap<(u32, i32), [i64; 4]> = FastMap::default();
+    let mut camp_all: CampMap = CampMap::default();
     for d in &dstates {
         for (k, v) in &d.camp {
             let a = camp_all.entry(*k).or_insert([0; 4]);
@@ -926,6 +1007,7 @@ fn main() {
     let dstates_ref = &dstates;
     let cat_names = &cat_names;
     let (camp_ids, camp_channels) = (&camp_ids, &camp_channels);
+    let long_names = &long_names;
     let ud = &ud;
     par(threads, dstates.len() + 1, || (), |_, i| {
         if i < dstates_ref.len() {
@@ -933,8 +1015,19 @@ fn main() {
             if rows.is_empty() && i > 0 {
                 return;
             }
+            let mut arena: Vec<u8> = Vec::with_capacity(rows.len() * 12);
+            let mut spans: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
+            for r in rows {
+                let s = arena.len();
+                if is_long(r.person) {
+                    arena.extend_from_slice(long_names[&r.person]);
+                } else {
+                    unpack(r.person, &mut arena);
+                }
+                spans.push((s, arena.len()));
+            }
             let cols = vec![
-                ("user_id", parquet::Col::Str(rows.iter().map(|r| r.person).collect())),
+                ("user_id", parquet::Col::Str(spans.iter().map(|&(a, b)| &arena[a..b]).collect())),
                 ("day", parquet::Col::Date(rows.iter().map(|r| r.day).collect())),
                 ("sessions", parquet::Col::I64(rows.iter().map(|r| r.sessions).collect())),
                 ("events", parquet::Col::I64(rows.iter().map(|r| r.events).collect())),
