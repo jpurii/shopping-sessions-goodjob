@@ -898,8 +898,14 @@ fn main() {
             }
         });
     });
+    // Software write-combining for the event scatter: each partition first
+    // collects WCN events in a small per-thread staging array, then moves them
+    // to its buffer in one burst (fewer L1/TLB misses with 1-2K partitions).
+    const WCN: usize = 4;
     struct AState {
         ev: Vec<Vec<Ev>>,
+        wc: Vec<Ev>,
+        wn: Vec<u8>,
         ck: Vec<Ck<'static>>,
         long: Vec<(u128, &'static [u8])>,
     }
@@ -920,7 +926,13 @@ fn main() {
         let a = par(
             threads,
             chunk_list.len() - nlk,
-            || AState { ev: (0..p_ev).map(|_| Vec::with_capacity(ev_reserve)).collect(), ck: Vec::new(), long: Vec::new() },
+            || AState {
+                ev: (0..p_ev).map(|_| Vec::with_capacity(ev_reserve)).collect(),
+                wc: vec![Ev { eid: 0, user: 0, ingest: 0, ts: 0, price: 0, cat: 0, kind: 0 }; p_ev * WCN],
+                wn: vec![0; p_ev],
+                ck: Vec::new(),
+                long: Vec::new(),
+            },
             |st, i| {
                 let (kind, ref sp) = chunk_list[i + nlk];
                 // The buffers live until main returns.
@@ -959,8 +971,24 @@ fn main() {
                                 }
                             }
                         }
-                        st.ev[part_of(eid, p_ev)].push(ev);
+                        let j = part_of(eid, p_ev);
+                        let n = st.wn[j] as usize;
+                        st.wc[j * WCN + n] = ev;
+                        if n + 1 == WCN {
+                            st.ev[j].extend_from_slice(&st.wc[j * WCN..j * WCN + WCN]);
+                            st.wn[j] = 0;
+                        } else {
+                            st.wn[j] = (n + 1) as u8;
+                        }
                     });
+                    // Flush the staged rows so every event of this chunk is in st.ev.
+                    for j in 0..p_ev {
+                        let n = st.wn[j] as usize;
+                        if n > 0 {
+                            st.ev[j].extend_from_slice(&st.wc[j * WCN..j * WCN + n]);
+                            st.wn[j] = 0;
+                        }
+                    }
                 } else {
                     scan::<4>(body, |f| {
                         if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
