@@ -444,17 +444,44 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// "YYYY-MM-DDTHH:MM:SS" (19 bytes) to epoch ms, validated.
+/// Checks the separators and all 14 digits with three word loads (SWAR):
+/// a = "YYYY-MM-", b = "DDTHH:MM", c = "M:SS" (bytes 15..19).
 #[inline]
 fn datetime(s: &[u8]) -> Option<i64> {
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap());
+    let c = u32::from_le_bytes(s[15..19].try_into().unwrap());
+    if a & 0xFF00_00FF_0000_0000 != 0x2D00_002D_0000_0000 // '-' at 4 and 7
+        || b & 0x0000_FF00_00FF_0000 != 0x0000_3A00_0054_0000 // 'T' at 10, ':' at 13
+        || c & 0x0000_FF00 != 0x0000_3A00
+    // ':' at 16
+    {
         return None;
     }
-    let y = d2(s, 0)? * 100 + d2(s, 2)?;
-    let mo = d2(s, 5)?;
-    let d = d2(s, 8)?;
-    let h = d2(s, 11)?;
-    let mi = d2(s, 14)?;
-    let se = d2(s, 17)?;
+    // A digit byte is 0x30..=0x39: high nibble 3, and still 3 after adding 6.
+    // Separator lanes are masked out and, being '-', 'T' or ':', cannot carry.
+    const H64: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const T64: u64 = 0x3030_3030_3030_3030;
+    const MA: u64 = 0x00FF_FF00_FFFF_FFFF; // digit lanes of a: 0,1,2,3,5,6
+    const MB: u64 = 0xFFFF_00FF_FF00_FFFF; // digit lanes of b: 0,1,3,4,6,7
+    const MC: u32 = 0xFFFF_0000; // digit lanes of c: 2,3
+    let ok64 = |x: u64, m: u64| {
+        x & H64 & m == T64 & m && x.wrapping_add(0x0606_0606_0606_0606) & H64 & m == T64 & m
+    };
+    let okc = c & 0xF0F0_F0F0 & MC == 0x3030_3030 & MC
+        && c.wrapping_add(0x0606_0606) & 0xF0F0_F0F0 & MC == 0x3030_3030 & MC;
+    if !(ok64(a, MA) && ok64(b, MB) && okc) {
+        return None;
+    }
+    let da = |i: u32| ((a >> (8 * i)) & 0xF) as u32;
+    let db = |i: u32| ((b >> (8 * i)) & 0xF) as u32;
+    let dc = |i: u32| ((c >> (8 * i)) & 0xF) as u32;
+    let y = da(0) * 1000 + da(1) * 100 + da(2) * 10 + da(3);
+    let mo = da(5) * 10 + da(6);
+    let d = db(0) * 10 + db(1);
+    let h = db(3) * 10 + db(4);
+    let mi = db(6) * 10 + db(7);
+    let se = dc(2) * 10 + dc(3);
     if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
@@ -1377,4 +1404,73 @@ fn main() {
     // its writer). Exit now: freeing gigabytes of buffers one by one on this
     // thread would add ~10% to the run, and the kernel reclaims it all anyway.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The byte-by-byte reference the SWAR `datetime` replaced.
+    fn datetime_ref(s: &[u8]) -> Option<i64> {
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let y = d2(s, 0)? * 100 + d2(s, 2)?;
+        let mo = d2(s, 5)?;
+        let d = d2(s, 8)?;
+        let h = d2(s, 11)?;
+        let mi = d2(s, 14)?;
+        let se = d2(s, 17)?;
+        if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dim = match mo {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if d > dim {
+            return None;
+        }
+        let days = days_from_civil(y as i64, mo, d);
+        Some(((days * 24 + h as i64) * 60 + mi as i64) * 60_000 + se as i64 * 1000)
+    }
+
+    #[test]
+    fn swar_datetime_matches_reference() {
+        let seeds: [&[u8; 19]; 6] = [
+            b"2026-10-03T23:58:10",
+            b"2028-02-29T00:00:00",
+            b"2027-02-29T12:30:59",
+            b"0000-01-01T00:00:00",
+            b"9999-12-31T23:59:59",
+            b"2026-13-40T24:60:60",
+        ];
+        let pool: &[u8] = b"0123456789-T:tZz /\x00\xff\x2f\x3a\x40\x39\x30\xfa\xc0";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for i in 0..2_000_000u64 {
+            let mut s = *seeds[(i % seeds.len() as u64) as usize];
+            for _ in 0..(next() % 4) {
+                let p = (next() % 19) as usize;
+                s[p] = if next() % 2 == 0 { pool[(next() % pool.len() as u64) as usize] } else { next() as u8 };
+            }
+            assert_eq!(datetime(&s), datetime_ref(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        // Every valid instant over a few years, day by day at several times.
+        for y in [1999u32, 2000, 2024, 2025, 2028, 2100] {
+            for mo in 1..=12u32 {
+                for d in 1..=31u32 {
+                    let s = format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}", d % 24, (d * 7) % 60, (d * 13) % 60);
+                    assert_eq!(datetime(s.as_bytes()), datetime_ref(s.as_bytes()), "{s}");
+                }
+            }
+        }
+    }
 }
