@@ -649,13 +649,13 @@ fn body_lines(b: &[u8]) -> impl Iterator<Item = &[u8]> {
     body.split(|&c| c == b'\n')
 }
 
-/// Union-find over all link pairs. Returns the ID table (key -> index), each
-/// ID's person key (the key of its person's byte-wise smallest ID), and each
-/// ID's key and bytes.
+/// Union-find over all link pairs. Returns the map from each linked ID's key
+/// to its person's key (the key of the person's byte-wise smallest ID), the
+/// number of linked IDs, and the bytes of linked IDs with long keys.
 #[allow(clippy::type_complexity)]
 fn build_links(
     lstates: &[Vec<(&'static [u8], &'static [u8])>],
-) -> (Table, Vec<u128>, Vec<u128>, Vec<&'static [u8]>) {
+) -> (PersonMap, usize, Vec<(u128, &'static [u8])>) {
     let nsides: usize = lstates.iter().map(|v| v.len() * 2).sum();
     let mut ids = Table::with_cap(nsides);
     let mut names: Vec<&'static [u8]> = Vec::with_capacity(nsides);
@@ -707,7 +707,15 @@ fn build_links(
         let r = find(&mut parent, i as u32);
         pkey[i] = keys[best[r as usize] as usize];
     }
-    (ids, pkey, keys, names)
+    // Linked key -> person key in one 32-byte slot (same layout as `ids`), so a
+    // lookup is one memory access; callers prefetch slots ahead of use.
+    let pmap = PersonMap {
+        e: ids.e.iter().map(|&(k, i)| (k, if k == 0 { 0 } else { pkey[i as usize] })).collect(),
+        mask: ids.mask,
+    };
+    let long: Vec<(u128, &'static [u8])> =
+        (0..n).filter(|&i| is_long(keys[i])).map(|i| (keys[i], names[i])).collect();
+    (pmap, n, long)
 }
 
 
@@ -834,7 +842,7 @@ fn main() {
     let (cw_lo, cw_hi) = (ws - WEEK, we);
     let product_cat = &product_cat;
     let camp_of = &camp_of;
-    let (astates, (ids, pkey, keys, names)) = std::thread::scope(|sc| {
+    let (astates, (pmap, n, long_links)) = std::thread::scope(|sc| {
         let links = sc.spawn(|| build_links(&lstates));
         let a = par(
             threads,
@@ -896,26 +904,16 @@ fn main() {
         log("parsed");
         (a, links.join().unwrap())
     });
-    let n = names.len();
     // Bytes of every long key that can name a person.
     let mut long_names: HashMap<u128, &[u8]> = HashMap::new();
-    for i in 0..n {
-        if is_long(keys[i]) {
-            long_names.insert(keys[i], names[i]);
-        }
+    for &(k, s) in &long_links {
+        long_names.insert(k, s);
     }
     for st in &astates {
         for &(k, s) in &st.long {
             long_names.insert(k, s);
         }
     }
-    // Linked key -> person key in one 32-byte slot (same layout as `ids`), so a
-    // lookup is one memory access; callers prefetch slots ahead of use.
-    let pmap = PersonMap {
-        e: ids.e.iter().map(|&(k, i)| (k, if k == 0 { 0 } else { pkey[i as usize] })).collect(),
-        mask: ids.mask,
-    };
-    drop(ids);
     let pmap = &pmap;
     let person_of = |u: u128| -> u128 { pmap.get(u) };
     log(&format!("links: {} ids", n));
