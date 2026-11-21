@@ -614,6 +614,68 @@ fn body_lines(b: &[u8]) -> impl Iterator<Item = &[u8]> {
     body.split(|&c| c == b'\n')
 }
 
+/// Union-find over all link pairs. Returns the ID table (key -> index), each
+/// ID's person key (the key of its person's byte-wise smallest ID), and each
+/// ID's key and bytes.
+#[allow(clippy::type_complexity)]
+fn build_links(
+    lstates: &[Vec<(&'static [u8], &'static [u8])>],
+) -> (Table, Vec<u128>, Vec<u128>, Vec<&'static [u8]>) {
+    let nsides: usize = lstates.iter().map(|v| v.len() * 2).sum();
+    let mut ids = Table::with_cap(nsides);
+    let mut names: Vec<&'static [u8]> = Vec::with_capacity(nsides);
+    let mut keys: Vec<u128> = Vec::with_capacity(nsides);
+    let mut parent: Vec<u32> = Vec::with_capacity(nsides);
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let p = parent[x as usize];
+            parent[x as usize] = parent[p as usize];
+            x = p;
+        }
+        x
+    }
+    for v in lstates {
+        for &(a, b) in v {
+            let mut id = |s: &'static [u8]| -> u32 {
+                let k = key(s);
+                let i = ids.slot(k);
+                if ids.e[i].0 == 0 {
+                    let n = names.len() as u32;
+                    ids.e[i] = (k, n);
+                    names.push(s);
+                    keys.push(k);
+                    parent.push(n);
+                    n
+                } else {
+                    ids.e[i].1
+                }
+            };
+            let ia = id(a);
+            let ib = id(b);
+            let ra = find(&mut parent, ia);
+            let rb = find(&mut parent, ib);
+            if ra != rb {
+                parent[ra.max(rb) as usize] = ra.min(rb);
+            }
+        }
+    }
+    let n = names.len();
+    let mut best: Vec<u32> = (0..n as u32).collect();
+    for i in 0..n as u32 {
+        let r = find(&mut parent, i);
+        if names[i as usize] < names[best[r as usize] as usize] {
+            best[r as usize] = i;
+        }
+    }
+    let mut pkey: Vec<u128> = vec![0; n];
+    for i in 0..n {
+        let r = find(&mut parent, i as u32);
+        pkey[i] = keys[best[r as usize] as usize];
+    }
+    (ids, pkey, keys, names)
+}
+
+
 fn main() {
     let t0 = Instant::now();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -714,26 +776,40 @@ fn main() {
     let chunk_list: Vec<(u8, SendPtr)> = raw_chunks.into_iter().map(|(k, p, l)| (k, SendPtr(p, l))).collect();
     log(&format!("{} files, {} chunks, {} threads", paths.len(), chunk_list.len(), threads));
 
-    // -------------------------------------------------- phase A: parse
-    struct AState<'a> {
+    // -------------------------------------------------- phase A: parse, phase B: links
+    // Link chunks come first in chunk_list. Parse them, then run the
+    // (sequential) union-find on its own thread while every worker parses
+    // events and clicks.
+    let nlk = chunk_list.iter().filter(|c| c.0 == 2).count();
+    let lstates = par(threads, nlk, Vec::new, |v: &mut Vec<(&'static [u8], &'static [u8])>, i| {
+        let sp = &chunk_list[i].1;
+        // The buffers live until main returns.
+        let body: &'static [u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
+        scan::<2>(body, |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                v.push((f[0], f[1]));
+            }
+        });
+    });
+    struct AState {
         ev: Vec<Vec<Ev>>,
-        ck: Vec<Ck<'a>>,
-        lk: Vec<(&'a [u8], &'a [u8])>,
-        long: Vec<(u128, &'a [u8])>,
+        ck: Vec<Ck<'static>>,
+        long: Vec<(u128, &'static [u8])>,
     }
     let (cw_lo, cw_hi) = (ws - WEEK, we);
     let product_cat = &product_cat;
     let camp_of = &camp_of;
-    let astates = par(
-        threads,
-        chunk_list.len(),
-        || AState { ev: (0..P).map(|_| Vec::new()).collect(), ck: Vec::new(), lk: Vec::new(), long: Vec::new() },
-        |st, i| {
-            let (kind, ref sp) = chunk_list[i];
-            // The buffers live until main returns.
-            let body: &[u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
-            match kind {
-                0 => {
+    let (astates, (ids, pkey, keys, names)) = std::thread::scope(|sc| {
+        let links = sc.spawn(|| build_links(&lstates));
+        let a = par(
+            threads,
+            chunk_list.len() - nlk,
+            || AState { ev: (0..P).map(|_| Vec::new()).collect(), ck: Vec::new(), long: Vec::new() },
+            |st, i| {
+                let (kind, ref sp) = chunk_list[i + nlk];
+                // The buffers live until main returns.
+                let body: &'static [u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
+                if kind == 0 {
                     scan::<7>(body, |f| {
                         if f[0].is_empty() {
                             return;
@@ -767,8 +843,7 @@ fn main() {
                         }
                         st.ev[part_of(eid, P)].push(ev);
                     });
-                }
-                1 => {
+                } else {
                     scan::<4>(body, |f| {
                         if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
                             return;
@@ -781,73 +856,12 @@ fn main() {
                         st.ck.push(Ck { user: key(f[1]), cid: f[0], ts, camp });
                     });
                 }
-                _ => {
-                    scan::<2>(body, |f| {
-                        if f[0].is_empty() || f[1].is_empty() {
-                            return;
-                        }
-                        st.lk.push((f[0], f[1]));
-                    });
-                }
-            }
-        },
-    );
-    log("parsed");
-
-    // -------------------------------------------------- phase B: links
-    let nsides: usize = astates.iter().map(|s| s.lk.len() * 2).sum();
-    let mut ids = Table::with_cap(nsides);
-    let mut names: Vec<&[u8]> = Vec::with_capacity(nsides);
-    let mut keys: Vec<u128> = Vec::with_capacity(nsides);
-    let mut parent: Vec<u32> = Vec::with_capacity(nsides);
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = p;
-        }
-        x
-    }
-    for st in &astates {
-        for &(a, b) in &st.lk {
-            let mut id = |s: &[u8]| -> u32 {
-                let k = key(s);
-                let i = ids.slot(k);
-                if ids.e[i].0 == 0 {
-                    let n = names.len() as u32;
-                    ids.e[i] = (k, n);
-                    // Safety: the slice borrows an input buffer that lives until main returns.
-                    names.push(unsafe { std::mem::transmute::<&[u8], &[u8]>(s) });
-                    keys.push(k);
-                    parent.push(n);
-                    n
-                } else {
-                    ids.e[i].1
-                }
-            };
-            let ia = id(a);
-            let ib = id(b);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                parent[ra.max(rb) as usize] = ra.min(rb);
-            }
-        }
-    }
+            },
+        );
+        log("parsed");
+        (a, links.join().unwrap())
+    });
     let n = names.len();
-    let mut best: Vec<u32> = (0..n as u32).collect();
-    for i in 0..n as u32 {
-        let r = find(&mut parent, i);
-        if names[i as usize] < names[best[r as usize] as usize] {
-            best[r as usize] = i;
-        }
-    }
-    // pkey[i] = key of ID i's person's name.
-    let mut pkey: Vec<u128> = vec![0; n];
-    for i in 0..n {
-        let r = find(&mut parent, i as u32);
-        pkey[i] = keys[best[r as usize] as usize];
-    }
     // Bytes of every long key that can name a person.
     let mut long_names: HashMap<u128, &[u8]> = HashMap::new();
     for i in 0..n {
