@@ -1340,7 +1340,8 @@ fn main() {
         }
     });
     log("written");
-    drop(bufs);
-    drop(products_buf);
-    drop(campaigns_buf);
+    // Every output file is written, flushed and closed (parquet::write drops
+    // its writer). Exit now: freeing gigabytes of buffers one by one on this
+    // thread would add ~10% to the run, and the kernel reclaims it all anyway.
+    std::process::exit(0);
 }
