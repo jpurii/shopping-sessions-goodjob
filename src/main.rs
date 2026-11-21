@@ -537,7 +537,10 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 struct Ev {
     eid: u128,
     user: u128,
-    ingest: i64,
+    /// ingest_ts in whole seconds from window_start - 2^31 s (always F1, so whole
+    /// seconds; exact within +-68 years of the window, saturating beyond).
+    /// Only compared between copies of one event_id. Keeps `Ev` at 48 bytes.
+    ingest: u32,
     ts: u32, // ms since window_start
     price: u32,
     cat: u16,
@@ -576,6 +579,8 @@ struct Sess {
     revenue: i64,
     purch: bool,
 }
+
+const _: () = assert!(std::mem::size_of::<Ev>() == 48);
 
 type CampMap = HashMap<(u32, i32), [i64; 4]>;
 
@@ -840,6 +845,7 @@ fn main() {
         long: Vec<(u128, &'static [u8])>,
     }
     let (cw_lo, cw_hi) = (ws - WEEK, we);
+    let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
     let product_cat = &product_cat;
     let camp_of = &camp_of;
     let (astates, (pmap, n, long_links)) = std::thread::scope(|sc| {
@@ -859,7 +865,8 @@ fn main() {
                         }
                         let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
                         let eid = key(f[0]);
-                        let mut ev = Ev { eid, user: 0, ingest, ts: 0, price: 0, cat: 0, kind: 0 };
+                        let ingest_rel = (ingest.div_euclid(1000) - ingest_base).clamp(0, u32::MAX as i64) as u32;
+                        let mut ev = Ev { eid, user: 0, ingest: ingest_rel, ts: 0, price: 0, cat: 0, kind: 0 };
                         if !f[1].is_empty() && !f[5].is_empty() {
                             if let Some(ts) = parse_ts(f[2]) {
                                 let k = match f[4] {
