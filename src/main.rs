@@ -44,6 +44,7 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
+const Q: usize = 256; // person partitions
 
 // ------------------------------------------------------------------ hashing
 
@@ -1075,21 +1076,17 @@ fn main() {
     let nst = astates.len();
     // Reserve each person-partition buffer up front (about twice a thread's
     // fair share of events) so the scatter never reallocates and copies.
-    // person partitions: about 20K event lines each, but at most 512: the
-    // dedup phase scatters into one buffer per partition and 2048 streams
-    // (v25, 20M events) cost more in the scatter than they saved later.
-    let q_pp = (ev_bytes / 64 / 20_000).next_power_of_two().clamp(256, 512);
-    let sv_reserve = ev_bytes / 64 / threads / q_pp * 2 + 16;
+    let sv_reserve = ev_bytes / 64 / threads / Q * 2 + 16;
     // Same for clicks (~40 bytes a click line).
     let ck_bytes: usize = paths.iter().zip(&bufs).filter(|(p, _)| p.0 == 1).map(|(_, b)| b.len).sum();
-    let ck_reserve = ck_bytes / 40 / threads / q_pp * 2 + 16;
+    let ck_reserve = ck_bytes / 40 / threads / Q * 2 + 16;
     let astates_ref = &astates;
     let cstates = par(
         threads,
         p_ev + nst,
         || CState {
-            sv: (0..q_pp).map(|_| Vec::with_capacity(sv_reserve)).collect(),
-            ck: (0..q_pp).map(|_| Vec::with_capacity(ck_reserve)).collect(),
+            sv: (0..Q).map(|_| Vec::with_capacity(sv_reserve)).collect(),
+            ck: (0..Q).map(|_| Vec::with_capacity(ck_reserve)).collect(),
             rows: Vec::new(),
             tab: Vec::new(),
             win: Vec::new(),
@@ -1137,7 +1134,7 @@ fn main() {
                     }
                     let r = &rows[win[w] as usize];
                     let person = person_of(r.user);
-                    st.sv[part_of(person, q_pp)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
+                    st.sv[part_of(person, Q)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                 }
             } else {
                 let cks = &astates_ref[i - p_ev].ck;
@@ -1147,7 +1144,7 @@ fn main() {
                     }
                     let c = &cks[w];
                     let person = person_of(c.user);
-                    st.ck[part_of(person, q_pp)].push(Cp { person, cid: c.cid, ts: c.ts, camp: c.camp });
+                    st.ck[part_of(person, Q)].push(Cp { person, cid: c.cid, ts: c.ts, camp: c.camp });
                 }
             }
         },
@@ -1169,7 +1166,7 @@ fn main() {
     let users_reserve = ev_bytes / 64 / 10 / threads * 3 / 2 + 16;
     let dstates = par(
         threads,
-        q_pp,
+        Q,
         || DState { users: Vec::with_capacity(users_reserve), camp: CampDays::new(ncamp, d0, nd) },
         |st, q| {
             // Group by person in linear time: dense local person ids from a flat
