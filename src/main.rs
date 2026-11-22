@@ -901,7 +901,7 @@ fn main() {
     // Software write-combining for the event scatter: each partition first
     // collects WCN events in a small per-thread staging array, then moves them
     // to its buffer in one burst (fewer L1/TLB misses with 1-2K partitions).
-    const WCN: usize = 8;
+    const WCN: usize = 16;
     struct AState {
         ev: Vec<Vec<Ev>>,
         wc: Vec<Ev>,
