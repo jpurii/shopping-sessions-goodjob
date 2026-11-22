@@ -901,7 +901,7 @@ fn main() {
     // Software write-combining for the event scatter: each partition first
     // collects WCN events in a small per-thread staging array, then moves them
     // to its buffer in one burst (fewer L1/TLB misses with 1-2K partitions).
-    const WCN: usize = 16;
+    const WCN: usize = 8;
     struct AState {
         ev: Vec<Vec<Ev>>,
         wc: Vec<Ev>,
@@ -1029,7 +1029,7 @@ fn main() {
         tab: Vec<u32>,
         win: Vec<u32>,
     }
-    const AHEAD: usize = 16; // prefetch distance for person lookups
+    const AHEAD: usize = 8; // prefetch distance for person lookups
     let nst = astates.len();
     // Reserve each person-partition buffer up front (about twice a thread's
     // fair share of events) so the scatter never reallocates and copies.
