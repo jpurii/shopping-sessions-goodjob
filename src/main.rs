@@ -180,6 +180,62 @@ impl Table {
     }
 }
 
+/// Exact 8-byte key of a non-empty ID of at most 7 bytes (bytes big-endian,
+/// then the length); None for longer IDs.
+#[inline]
+fn key64(s: &[u8]) -> Option<u64> {
+    let n = s.len();
+    if n == 0 || n > 7 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    b[..n].copy_from_slice(s);
+    b[7] = n as u8;
+    Some(u64::from_be_bytes(b))
+}
+
+/// Open-addressing map from non-zero u64 keys to u16, kept small for cache.
+struct SmallTable {
+    keys: Vec<u64>,
+    vals: Vec<u16>,
+    mask: usize,
+}
+
+impl SmallTable {
+    fn with_cap(n: usize) -> SmallTable {
+        let cap = (n.max(8) * 2).next_power_of_two();
+        SmallTable { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1 }
+    }
+    #[inline]
+    fn slot(&self, k: u64) -> usize {
+        let mut i = mum(k ^ K0, K1) as usize & self.mask;
+        loop {
+            let x = self.keys[i];
+            if x == k || x == 0 {
+                return i;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// Keeps the first value for a repeated key.
+    fn insert(&mut self, k: u64, v: u16) {
+        let i = self.slot(k);
+        if self.keys[i] == 0 {
+            self.keys[i] = k;
+            self.vals[i] = v;
+        }
+    }
+    #[inline]
+    fn get(&self, k: u64) -> Option<u16> {
+        let i = self.slot(k);
+        if self.keys[i] == k {
+            Some(self.vals[i])
+        } else {
+            None
+        }
+    }
+}
+
 /// Open-addressing map from linked ID key to person key; unlinked keys map to
 /// themselves.
 struct PersonMap {
@@ -847,7 +903,10 @@ fn main() {
     let mut cat_names: Vec<&[u8]> = Vec::new();
     let mut cat_of_name: HashMap<&[u8], u16> = HashMap::new();
     let nprod = body_lines(products_buf.bytes()).count();
-    let mut product_cat = Table::with_cap(nprod);
+    // Product IDs up to 7 bytes (all generated ones) live in a compact u64 table
+    // (~1 MB, stays in cache); longer IDs in the general table. Routed by length.
+    let mut product_cat = Table::with_cap(8);
+    let mut product_small = SmallTable::with_cap(nprod);
     for line in body_lines(products_buf.bytes()) {
         let mut f = [&b""[..]; 2];
         if !fields(line, &mut f) || f[0].is_empty() {
@@ -858,9 +917,13 @@ fn main() {
             cat_names.push(f[1]);
             next
         });
-        let s = product_cat.slot(key(f[0]));
-        if product_cat.e[s].0 == 0 {
-            product_cat.e[s] = (key(f[0]), c as u32);
+        if let Some(k) = key64(f[0]) {
+            product_small.insert(k, c);
+        } else {
+            let s = product_cat.slot(key(f[0]));
+            if product_cat.e[s].0 == 0 {
+                product_cat.e[s] = (key(f[0]), c as u32);
+            }
         }
     }
     let unknown = cat_names.len() as u16;
@@ -962,6 +1025,7 @@ fn main() {
     let ev_reserve = ev_bytes / 64 / threads / p_ev * 2 + 16;
     let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
     let product_cat = &product_cat;
+    let product_small = &product_small;
     let camp_of = &camp_of;
     let (mut astates, (pmap, n, long_links)) = std::thread::scope(|sc| {
         let links = sc.spawn(|| build_links(&lstates));
@@ -1008,7 +1072,11 @@ fn main() {
                                         ev.ts = (ts - ws) as u32;
                                         ev.kind = k;
                                         ev.price = price;
-                                        ev.cat = product_cat.get(key_in(f[5], end)).map(|c| c as u16).unwrap_or(unknown);
+                                        let pc = match key64(f[5]) {
+                                            Some(k) => product_small.get(k),
+                                            None => product_cat.get(key_in(f[5], end)).map(|c| c as u16),
+                                        };
+                                        ev.cat = pc.unwrap_or(unknown);
                                     }
                                 }
                             }
