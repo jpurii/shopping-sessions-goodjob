@@ -732,24 +732,6 @@ struct SendPtr(*const u8, usize);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
-/// Maps this thread's whole chunk of an input file in one call
-/// (MADV_POPULATE_READ, Linux 5.14+) instead of one page fault per few pages
-/// while scanning. Harmless no-op where unsupported.
-#[cfg(target_os = "linux")]
-fn populate(b: &[u8]) {
-    extern "C" {
-        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    }
-    let p = b.as_ptr() as usize;
-    let a = p & !4095;
-    let len = p + b.len() - a;
-    if !b.is_empty() {
-        unsafe { madvise(a as *mut u8, len, 22) }; // MADV_POPULATE_READ
-    }
-}
-#[cfg(not(target_os = "linux"))]
-fn populate(_: &[u8]) {}
-
 fn find_json_str<'a>(json: &'a [u8], key: &str) -> &'a [u8] {
     let pat = format!("\"{key}\"");
     let pos = json
@@ -933,7 +915,7 @@ fn main() {
     let bufs: Vec<Buf> = slots.into_iter().map(|b| b.unwrap()).collect();
     let mut raw_chunks = Vec::new();
     for (i, (kind, _)) in paths.iter().enumerate() {
-        chunks(bufs[i].bytes(), 8 << 20, &mut raw_chunks, *kind);
+        chunks(bufs[i].bytes(), 2 << 20, &mut raw_chunks, *kind);
     }
     // Links first so the (single-threaded) union-find input is ready early.
     raw_chunks.sort_by_key(|c| match c.0 {
@@ -997,7 +979,6 @@ fn main() {
                 let (kind, ref sp) = chunk_list[i + nlk];
                 // The buffers live until main returns.
                 let body: &'static [u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
-                populate(body);
                 let end = body.as_ptr() as usize + body.len();
                 if kind == 0 {
                     scan::<7>(body, |f| {
