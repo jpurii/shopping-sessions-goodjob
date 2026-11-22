@@ -951,9 +951,9 @@ fn main() {
     // Reserve each partition buffer up front (about twice a thread's fair share
     // at ~64 bytes per event line) so pushes never reallocate and copy.
     let ev_bytes: usize = paths.iter().zip(&bufs).filter(|(p, _)| p.0 == 0).map(|(_, b)| b.len).sum();
-    // event_id partitions: about 40K event lines each (~64 bytes a line), so a
+    // event_id partitions: about 10K event lines each (~64 bytes a line), so a
     // partition's rows and dedup table stay cache-sized as the input grows.
-    let prows: usize = 40_000;
+    let prows: usize = 10_000;
     let p_ev = (ev_bytes / 64 / prows).next_power_of_two().clamp(256, 8192);
     let ev_reserve = ev_bytes / 64 / threads / p_ev * 2 + 16;
     let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
