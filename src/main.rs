@@ -58,6 +58,21 @@ fn mum(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
+fn hash_bytes(b: &[u8], seed: u64) -> u64 {
+    let mut h = (b.len() as u64) ^ seed;
+    let mut it = b.chunks_exact(8);
+    for c in &mut it {
+        h = mum(h ^ u64::from_le_bytes(c.try_into().unwrap()), K1);
+    }
+    let r = it.remainder();
+    if !r.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..r.len()].copy_from_slice(r);
+        h = mum(h ^ u64::from_le_bytes(buf), K2);
+    }
+    mum(h, K1 ^ K2)
+}
+
 /// Exact key of a non-empty ID. Short IDs (<= 15 bytes): bytes big-endian, then
 /// the length, so comparing keys compares bytes. Long IDs: low byte 0xFF.
 #[inline]
@@ -69,34 +84,10 @@ fn key(s: &[u8]) -> u128 {
         b[15] = n as u8;
         u128::from_be_bytes(b)
     } else {
-        long_key(s)
+        let h1 = hash_bytes(s, K0) as u128;
+        let h2 = hash_bytes(s, K2) as u128;
+        (h1 << 64) | (h2 << 8) | 0xFF
     }
-}
-
-/// 120-bit hash key of an ID longer than 15 bytes (low byte 0xFF marks it
-/// long): two independent 64-bit lanes computed in one pass over the bytes.
-#[inline]
-fn long_key(s: &[u8]) -> u128 {
-    const K3: u64 = 0x5851_f42d_4c95_7f2d;
-    let n = s.len() as u64;
-    let (mut h1, mut h2) = (n ^ K0, n ^ K2);
-    let mut it = s.chunks_exact(8);
-    for c in &mut it {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
-        h1 = mum(h1 ^ w, K1);
-        h2 = mum(h2 ^ w, K3);
-    }
-    let r = it.remainder();
-    if !r.is_empty() {
-        let mut buf = [0u8; 8];
-        buf[..r.len()].copy_from_slice(r);
-        let w = u64::from_le_bytes(buf);
-        h1 = mum(h1 ^ w, K2);
-        h2 = mum(h2 ^ w, K1 ^ K3);
-    }
-    let h1 = mum(h1, K1 ^ K2) as u128;
-    let h2 = mum(h2, K0 ^ K3) as u128;
-    (h1 << 64) | (h2 << 8) | 0xFF
 }
 
 /// `key(s)` for a slice that lies inside a buffer ending at address `end`:
