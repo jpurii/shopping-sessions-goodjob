@@ -17,6 +17,26 @@
 mod parquet;
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Hasher for keys that are already uniform 128-bit hashes (long-ID keys):
+/// folds the bits instead of rehashing them with SipHash.
+#[derive(Default)]
+struct KeyHasher(u64);
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = self.0.rotate_left(8) ^ x as u64;
+        }
+    }
+    fn write_u128(&mut self, v: u128) {
+        self.0 = (v as u64) ^ ((v >> 64) as u64);
+    }
+}
+type KeyMap<V> = HashMap<u128, V, BuildHasherDefault<KeyHasher>>;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -1038,7 +1058,7 @@ fn main() {
     // output is written, so build the map on a background thread meanwhile.
     let long_lists: Vec<Vec<(u128, &'static [u8])>> = astates.iter_mut().map(|st| std::mem::take(&mut st.long)).collect();
     let long_job = std::thread::spawn(move || {
-        let mut m: HashMap<u128, &'static [u8]> = HashMap::new();
+        let mut m: KeyMap<&'static [u8]> = KeyMap::default();
         for &(k, s) in &long_links {
             m.insert(k, s);
         }
