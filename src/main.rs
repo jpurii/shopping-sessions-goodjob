@@ -1075,9 +1075,10 @@ fn main() {
     let nst = astates.len();
     // Reserve each person-partition buffer up front (about twice a thread's
     // fair share of events) so the scatter never reallocates and copies.
-    // person partitions: about 20K event lines each (as for event_id), so a
-    // partition's grouping table and rows stay cache-sized at 20M-60M events.
-    let q_pp = (ev_bytes / 64 / 20_000).next_power_of_two().clamp(256, 8192);
+    // person partitions: about 20K event lines each, but at most 512: the
+    // dedup phase scatters into one buffer per partition and 2048 streams
+    // (v25, 20M events) cost more in the scatter than they saved later.
+    let q_pp = (ev_bytes / 64 / 20_000).next_power_of_two().clamp(256, 512);
     let sv_reserve = ev_bytes / 64 / threads / q_pp * 2 + 16;
     // Same for clicks (~40 bytes a click line).
     let ck_bytes: usize = paths.iter().zip(&bufs).filter(|(p, _)| p.0 == 1).map(|(_, b)| b.len).sum();
