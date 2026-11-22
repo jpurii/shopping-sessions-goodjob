@@ -3,8 +3,11 @@ FROM rust:1.90-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Profile-guided optimization: pgo.profdata was recorded by running an
+# instrumented build of this code on generated data (no data is shipped).
+COPY pgo.profdata ./pgo.profdata
 # Scorers are Cascade Lake or newer Xeons; AVX2 (x86-64-v3) is safe there.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -Cprofile-use=/src/pgo.profdata"
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
