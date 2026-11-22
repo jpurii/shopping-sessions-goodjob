@@ -115,6 +115,18 @@ struct Table {
 }
 
 impl Table {
+    /// Starts loading the slot `k` hashes to, ahead of a later lookup.
+    #[inline(always)]
+    fn prefetch(&self, k: u128) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let p = self.e.as_ptr().add(hk(k) as usize & self.mask);
+            _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = k;
+    }
     fn with_cap(n: usize) -> Table {
         let cap = (n.max(8) * 2).next_power_of_two();
         Table { e: vec![(0, 0); cap], mask: cap - 1 }
@@ -717,9 +729,10 @@ fn body_lines(b: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// to its person's key (the key of the person's byte-wise smallest ID), the
 /// number of linked IDs, and the bytes of linked IDs with long keys.
 #[allow(clippy::type_complexity)]
-fn build_links(
-    lstates: &[Vec<(&'static [u8], &'static [u8])>],
-) -> (PersonMap, usize, Vec<(u128, &'static [u8])>) {
+/// A link line: both IDs' keys (computed in the parallel parse) and bytes.
+type LinkPair = (u128, &'static [u8], u128, &'static [u8]);
+
+fn build_links(lstates: &[Vec<LinkPair>]) -> (PersonMap, usize, Vec<(u128, &'static [u8])>) {
     let nsides: usize = lstates.iter().map(|v| v.len() * 2).sum();
     let mut ids = Table::with_cap(nsides);
     let mut names: Vec<&'static [u8]> = Vec::with_capacity(nsides);
@@ -733,10 +746,15 @@ fn build_links(
         }
         x
     }
+    // The table is far larger than cache: prefetch both slots LA pairs ahead.
+    const LA: usize = 16;
     for v in lstates {
-        for &(a, b) in v {
-            let mut id = |s: &'static [u8]| -> u32 {
-                let k = key(s);
+        for (w, &(ka, a, kb, b)) in v.iter().enumerate() {
+            if let Some(&(pa, _, pb, _)) = v.get(w + LA) {
+                ids.prefetch(pa);
+                ids.prefetch(pb);
+            }
+            let mut id = |k: u128, s: &'static [u8]| -> u32 {
                 let i = ids.slot(k);
                 if ids.e[i].0 == 0 {
                     let n = names.len() as u32;
@@ -749,8 +767,8 @@ fn build_links(
                     ids.e[i].1
                 }
             };
-            let ia = id(a);
-            let ib = id(b);
+            let ia = id(ka, a);
+            let ib = id(kb, b);
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
             if ra != rb {
@@ -888,13 +906,13 @@ fn main() {
     // (sequential) union-find on its own thread while every worker parses
     // events and clicks.
     let nlk = chunk_list.iter().filter(|c| c.0 == 2).count();
-    let lstates = par(threads, nlk, Vec::new, |v: &mut Vec<(&'static [u8], &'static [u8])>, i| {
+    let lstates = par(threads, nlk, Vec::new, |v: &mut Vec<LinkPair>, i| {
         let sp = &chunk_list[i].1;
         // The buffers live until main returns.
         let body: &'static [u8] = unsafe { std::slice::from_raw_parts(sp.0, sp.1) };
         scan::<2>(body, |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
-                v.push((f[0], f[1]));
+                v.push((key(f[0]), f[0], key(f[1]), f[1]));
             }
         });
     });
@@ -921,7 +939,7 @@ fn main() {
     let ingest_base = ws.div_euclid(1000) - (1i64 << 31);
     let product_cat = &product_cat;
     let camp_of = &camp_of;
-    let (astates, (pmap, n, long_links)) = std::thread::scope(|sc| {
+    let (mut astates, (pmap, n, long_links)) = std::thread::scope(|sc| {
         let links = sc.spawn(|| build_links(&lstates));
         let a = par(
             threads,
@@ -1007,16 +1025,21 @@ fn main() {
         log("parsed");
         (a, links.join().unwrap())
     });
-    // Bytes of every long key that can name a person.
-    let mut long_names: HashMap<u128, &[u8]> = HashMap::new();
-    for &(k, s) in &long_links {
-        long_names.insert(k, s);
-    }
-    for st in &astates {
-        for &(k, s) in &st.long {
-            long_names.insert(k, s);
+    // Bytes of every long key that can name a person: only needed when the
+    // output is written, so build the map on a background thread meanwhile.
+    let long_lists: Vec<Vec<(u128, &'static [u8])>> = astates.iter_mut().map(|st| std::mem::take(&mut st.long)).collect();
+    let long_job = std::thread::spawn(move || {
+        let mut m: HashMap<u128, &'static [u8]> = HashMap::new();
+        for &(k, s) in &long_links {
+            m.insert(k, s);
         }
-    }
+        for l in &long_lists {
+            for &(k, s) in l {
+                m.insert(k, s);
+            }
+        }
+        m
+    });
     let pmap = &pmap;
     let person_of = |u: u128| -> u128 { pmap.get(u) };
     log(&format!("links: {} ids", n));
@@ -1384,6 +1407,7 @@ fn main() {
     let dstates_ref = &dstates;
     let cat_names = &cat_names;
     let (camp_ids, camp_channels) = (&camp_ids, &camp_channels);
+    let long_names = long_job.join().unwrap();
     let long_names = &long_names;
     let ud = &ud;
     par(threads, dstates.len() + 1, || (), |_, i| {
