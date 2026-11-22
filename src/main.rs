@@ -42,6 +42,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 const DAY: i64 = 86_400_000;
+// Dedup row index: (parse thread << IDX_BITS) | position in its buffer.
+const IDX_BITS: u32 = 27;
+const IDX_MASK: u32 = (1 << IDX_BITS) - 1;
+const MAX_THREADS: usize = 31; // thread 31 + IDX_MASK would equal the empty marker
 const WEEK: i64 = 7 * DAY;
 const GAP: i64 = 1_800_000;
 const Q: usize = 256; // person partitions
@@ -830,7 +834,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-        .max(1);
+        .clamp(1, MAX_THREADS);
     let log = |msg: &str| eprintln!("[{:>7.1} ms] {msg}", t0.elapsed().as_secs_f64() * 1000.0);
 
     // -------------------------------------------------- small inputs
@@ -1068,7 +1072,6 @@ fn main() {
     struct CState<'a> {
         sv: Vec<Vec<Sv>>,
         ck: Vec<Vec<Cp<'a>>>,
-        rows: Vec<Ev>,
         tab: Vec<u32>,
         win: Vec<u32>,
     }
@@ -1087,52 +1090,58 @@ fn main() {
         || CState {
             sv: (0..Q).map(|_| Vec::with_capacity(sv_reserve)).collect(),
             ck: (0..Q).map(|_| Vec::with_capacity(ck_reserve)).collect(),
-            rows: Vec::new(),
             tab: Vec::new(),
             win: Vec::new(),
         },
         |st, i| {
             if i < p_ev {
-                let rows = &mut st.rows;
-                rows.clear();
-                for a in astates_ref {
-                    rows.extend_from_slice(&a.ev[i]);
-                }
-                let cap = (rows.len().max(8) * 2).next_power_of_two();
+                // Rows stay in the parse threads' buffers (no ~48 B/row copy):
+                // an index is (thread << IDX_BITS) | position.
+                let srcs: [&[Ev]; MAX_THREADS] = std::array::from_fn(|t| match astates_ref.get(t) {
+                    Some(a) => &a.ev[i][..],
+                    None => &[][..],
+                });
+                let row = |v: u32| -> &Ev { &srcs[(v >> IDX_BITS) as usize][(v & IDX_MASK) as usize] };
+                let n: usize = srcs.iter().map(|s| s.len()).sum();
+                let cap = (n.max(8) * 2).next_power_of_two();
                 let mask = cap - 1;
                 let tab = &mut st.tab;
                 tab.clear();
                 tab.resize(cap, u32::MAX);
-                for j in 0..rows.len() {
-                    let k = rows[j].eid;
-                    let mut s = hk(k) as usize & mask;
-                    loop {
-                        let v = tab[s];
-                        if v == u32::MAX {
-                            tab[s] = j as u32;
-                            break;
-                        }
-                        if rows[v as usize].eid == k {
-                            if rows[j].ingest < rows[v as usize].ingest {
-                                tab[s] = j as u32;
+                for (t, src) in srcs.iter().enumerate() {
+                    for (l, r) in src.iter().enumerate() {
+                        let j = ((t as u32) << IDX_BITS) | l as u32;
+                        let k = r.eid;
+                        let mut s = hk(k) as usize & mask;
+                        loop {
+                            let v = tab[s];
+                            if v == u32::MAX {
+                                tab[s] = j;
+                                break;
                             }
-                            break;
+                            let o = row(v);
+                            if o.eid == k {
+                                if r.ingest < o.ingest {
+                                    tab[s] = j;
+                                }
+                                break;
+                            }
+                            s = (s + 1) & mask;
                         }
-                        s = (s + 1) & mask;
                     }
                 }
                 let win = &mut st.win;
                 win.clear();
                 for &j in tab.iter() {
-                    if j != u32::MAX && rows[j as usize].kind != 0 {
+                    if j != u32::MAX && row(j).kind != 0 {
                         win.push(j);
                     }
                 }
                 for w in 0..win.len() {
                     if w + AHEAD < win.len() {
-                        pmap.prefetch(rows[win[w + AHEAD] as usize].user);
+                        pmap.prefetch(row(win[w + AHEAD]).user);
                     }
-                    let r = &rows[win[w] as usize];
+                    let r = row(win[w]);
                     let person = person_of(r.user);
                     st.sv[part_of(person, Q)].push(Sv { person, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
                 }
